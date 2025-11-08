@@ -506,8 +506,16 @@ async function queryObjects(userId, query) {
   }
 
   // Get all user's video data (limit to recent 50 to reduce payload size)
+  // Only get processed videos with actual data
   const videos = await db.collection('videos')
-    .find({ userId })
+    .find({ 
+      userId,
+      processed: true,
+      $or: [
+        { 'objects.0': { $exists: true } }, // Has at least one object
+        { summary: { $ne: '' } } // Or has a summary
+      ]
+    })
     .sort({ uploadedAt: -1 })
     .limit(50)
     .project({
@@ -521,6 +529,32 @@ async function queryObjects(userId, query) {
       _id: 1
     })
     .toArray();
+
+  // If no processed videos found, return helpful message
+  if (videos.length === 0) {
+    const unprocessedCount = await db.collection('videos').countDocuments({ 
+      userId, 
+      processed: false 
+    });
+    
+    if (unprocessedCount > 0) {
+      return {
+        queryType: 'general',
+        object: '',
+        answer: `I found ${unprocessedCount} video(s) that are still being processed. Please wait a few moments and try again.`,
+        matches: [],
+        bestMatch: null
+      };
+    }
+    
+    return {
+      queryType: 'general',
+      object: '',
+      answer: "I don't have any processed videos yet. Please upload a video and wait for it to be processed.",
+      matches: [],
+      bestMatch: null
+    };
+  }
 
   // Use Gemini to understand the query and search
   const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
@@ -603,6 +637,7 @@ async function answerVideoQuestion(userId, query, videoId = null) {
     videos = [video];
   } else {
     // Answer question across all videos (limit to recent 10)
+    // Prefer processed videos, but include unprocessed ones if no processed videos exist
     videos = await db.collection('videos')
       .find({ userId })
       .sort({ uploadedAt: -1 })
@@ -616,6 +651,7 @@ async function answerVideoQuestion(userId, query, videoId = null) {
         scenes: 1,
         summary: 1,
         videoPath: 1,
+        processed: 1,
         _id: 1
       })
       .toArray();
@@ -628,6 +664,86 @@ async function answerVideoQuestion(userId, query, videoId = null) {
       matches: []
     };
   }
+
+  // Filter to only processed videos with data, or try to use video file directly
+  const processedVideos = videos.filter(v => 
+    v.processed && (
+      (v.objects && v.objects.length > 0) || 
+      (v.summary && v.summary.trim() !== '')
+    )
+  );
+
+  // If no processed videos but we have video files, try analyzing them directly
+  if (processedVideos.length === 0 && !videoId) {
+    // Check if any videos have videoPath we can analyze
+    const videosWithPath = videos.filter(v => v.videoPath);
+    if (videosWithPath.length > 0) {
+      // Try analyzing the most recent video directly
+      try {
+        const videoToAnalyze = videosWithPath[0];
+        const videoData = await fs.readFile(videoToAnalyze.videoPath);
+        const base64Video = videoData.toString('base64');
+        
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+        const prompt = `User question: "${query}"
+
+Analyze this video and answer the question in detail. Provide:
+1. A clear, comprehensive answer
+2. Relevant timestamps where the answer can be found
+3. Any important details or context
+
+Answer:`;
+
+        const result = await generateContentWithRetry(model, [
+          prompt,
+          {
+            inlineData: {
+              mimeType: 'video/mp4',
+              data: base64Video
+            }
+          }
+        ]);
+
+        const response = await result.response;
+        const answer = response.text();
+        
+        return {
+          answer,
+          queryType: 'general',
+          videoId: videoToAnalyze._id.toString(),
+          filename: videoToAnalyze.filename,
+          matches: [{
+            videoId: videoToAnalyze._id.toString(),
+            filename: videoToAnalyze.filename,
+            relevantInfo: answer,
+            uploadedAt: videoToAnalyze.uploadedAt
+          }],
+          bestMatch: {
+            videoId: videoToAnalyze._id.toString(),
+            filename: videoToAnalyze.filename,
+            relevantInfo: answer,
+            uploadedAt: videoToAnalyze.uploadedAt
+          }
+        };
+      } catch (error) {
+        console.error('Error analyzing video directly:', error);
+        // Fall through to check for unprocessed videos
+      }
+    }
+
+    // Check if videos are still processing
+    const unprocessedCount = videos.filter(v => !v.processed || (!v.objects?.length && !v.summary)).length;
+    if (unprocessedCount > 0) {
+      return {
+        answer: `I found ${unprocessedCount} video(s) that are still being processed. Please wait a few moments and try again. The videos are being analyzed by AI to extract objects, activities, and other information.`,
+        queryType: 'general',
+        matches: []
+      };
+    }
+  }
+
+  // Use processed videos if available, otherwise fall back to all videos
+  const videosToUse = processedVideos.length > 0 ? processedVideos : videos;
 
   const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
   
@@ -681,7 +797,7 @@ Answer:`;
   const prompt = `User question: "${query}"
 
 Video information:
-${JSON.stringify(videos.map(v => ({
+${JSON.stringify(videosToUse.map(v => ({
   filename: v.filename,
   uploadedAt: v.uploadedAt,
   summary: (v.summary || '').substring(0, 500),
@@ -726,7 +842,7 @@ Answer the question based on the video information provided. Be specific and ref
   return {
     answer: text,
     queryType: 'general',
-    matches: videos.map(v => ({
+    matches: videosToUse.map(v => ({
       videoId: v._id.toString(),
       filename: v.filename,
       uploadedAt: v.uploadedAt
@@ -1373,9 +1489,24 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
     // Log video info for debugging
     console.log(`📹 Processing video chunk: ${(videoSize / 1024).toFixed(2)}KB, mimeType: ${mimeType}`);
     
-    // Check if question is about past/memory (e.g., "did I leave", "what was", "just showed", "held up")
+    // Check if question is about past/memory (e.g., "did I leave", "what was", "just showed")
+    // NOTE: Present tense questions like "what am I holding" should analyze current video, not memory
     const lowerQuestion = question.toLowerCase();
-    isMemoryQuestion = lowerQuestion.includes('did i') || 
+    
+    // Present tense indicators - these should analyze current video, not memory
+    const isPresentTense = lowerQuestion.includes('what am i') ||
+                          lowerQuestion.includes('what are you') ||
+                          lowerQuestion.includes('what is') ||
+                          lowerQuestion.includes('what\'s') ||
+                          lowerQuestion.includes('what do you see') ||
+                          lowerQuestion.includes('what can you see') ||
+                          lowerQuestion.includes('what does this') ||
+                          lowerQuestion.includes('what\'s this') ||
+                          lowerQuestion.includes('what\'s that');
+    
+    // Only treat as memory question if it's clearly about the past AND not present tense
+    isMemoryQuestion = !isPresentTense && (
+                            lowerQuestion.includes('did i') || 
                             lowerQuestion.includes('left') || 
                             lowerQuestion.includes('ago') || 
                             lowerQuestion.includes('earlier') ||
@@ -1391,18 +1522,16 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
                             lowerQuestion.includes('i showed') ||
                             lowerQuestion.includes('remember') ||
                             lowerQuestion.includes('what did i') ||
-                            lowerQuestion.includes('held up') ||
-                            lowerQuestion.includes('held') ||
-                            lowerQuestion.includes('i held') ||
-                            lowerQuestion.includes('did i hold') ||
-                            lowerQuestion.includes('what can') ||
-                            lowerQuestion.includes('what did');
+                            (lowerQuestion.includes('held up') && !lowerQuestion.includes('what am i')) || // "what did I hold up" not "what am I holding up"
+                            (lowerQuestion.includes('i held') && !lowerQuestion.includes('what am i')) ||
+                            lowerQuestion.includes('did i hold'));
 
     let prompt;
     let memoryContext = '';
 
     // For memory questions, check both current session and historical sessions
-    if (isMemoryQuestion) {
+    // For present tense questions, skip memory lookup and analyze current video directly
+    if (isMemoryQuestion && !isPresentTense) {
       // Get current session objects and activities
       const currentObjects = session.objects
         .slice(-50) // Last 50 objects
@@ -1422,7 +1551,7 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
           source: 'current_session'
         }));
 
-      // Get historical session memories from MongoDB
+      // Get historical session memories from MongoDB (only for past-tense questions)
       const historicalMemories = await getHistoricalSessionMemories(userId || 'anonymous', 10);
       
       // Combine current and historical objects/activities
@@ -1473,17 +1602,18 @@ ALL ACTIVITIES (current + historical):
 ${JSON.stringify(allActivities, null, 2)}
 `;
 
-      // For strong memory questions (past tense, "just", "was", "held"), prioritize memory
-      const isStrongMemoryQuestion = lowerQuestion.includes('what was') ||
+      // For strong memory questions (past tense, "just", "was"), prioritize memory
+      // Exclude present tense questions
+      const isStrongMemoryQuestion = !isPresentTense && (
+                                     lowerQuestion.includes('what was') ||
                                      lowerQuestion.includes('just showed') ||
                                      lowerQuestion.includes('just did') ||
                                      lowerQuestion.includes('i just') ||
                                      lowerQuestion.includes('did i leave') ||
                                      lowerQuestion.includes('was there') ||
-                                     lowerQuestion.includes('held up') ||
-                                     lowerQuestion.includes('i held') ||
-                                     lowerQuestion.includes('what can') ||
-                                     lowerQuestion.includes('what did');
+                                     (lowerQuestion.includes('held up') && lowerQuestion.includes('did i')) || // "what did I hold up" not "what am I holding up"
+                                     (lowerQuestion.includes('i held') && !lowerQuestion.includes('what am i')) ||
+                                     lowerQuestion.includes('what did'));
 
       if (isStrongMemoryQuestion) {
         // Answer from memory only - don't require video
