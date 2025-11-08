@@ -60,12 +60,78 @@ let solanaConnection;
 async function connectMongoDB() {
   try {
     const mongoUri = process.env.MONGODB_URI || 'mongodb+srv://user:pass@cluster.mongodb.net/memoryglass?retryWrites=true&w=majority';
-    mongoClient = new MongoClient(mongoUri);
+    
+    // Debug: Log connection attempt (without exposing full URI)
+    const uriParts = mongoUri.split('@');
+    const displayUri = uriParts.length > 1 
+      ? `mongodb+srv://***@${uriParts[1]}` 
+      : 'mongodb+srv://***';
+    console.log(`🔌 Attempting MongoDB connection to: ${displayUri}`);
+    console.log(`📋 Database name: memoryglass`);
+    
+    if (!mongoUri || mongoUri.includes('user:pass') || mongoUri.includes('***')) {
+      console.warn('⚠️  Warning: Using default/placeholder MongoDB URI. Set MONGODB_URI in .env file.');
+    }
+    
+    // MongoDB connection options
+    // Note: mongodb+srv:// automatically uses TLS, so we don't need to set tls: true
+    const mongoOptions = {
+      serverSelectionTimeoutMS: 15000, // 15 second timeout
+      connectTimeoutMS: 15000,
+      // Let MongoDB driver handle TLS automatically for mongodb+srv://
+    };
+    
+    mongoClient = new MongoClient(mongoUri, mongoOptions);
+    
+    console.log('⏳ Connecting to MongoDB...');
     await mongoClient.connect();
+    
+    // Test the connection
+    await mongoClient.db('admin').command({ ping: 1 });
+    console.log('✅ MongoDB ping successful');
+    
     db = mongoClient.db('memoryglass');
-    console.log('✅ Connected to MongoDB Atlas');
+    
+    // Verify database access
+    const collections = await db.listCollections().toArray();
+    console.log(`✅ Connected to MongoDB Atlas`);
+    console.log(`📊 Database: memoryglass`);
+    console.log(`📁 Collections found: ${collections.length}`);
+    if (collections.length > 0) {
+      console.log(`   - ${collections.map(c => c.name).join(', ')}`);
+    }
   } catch (error) {
-    console.error('❌ MongoDB connection error:', error);
+    console.error('❌ MongoDB connection error:');
+    console.error(`   Error name: ${error.name}`);
+    console.error(`   Error message: ${error.message}`);
+    
+    if (error.message.includes('authentication failed')) {
+      console.error('   🔐 Issue: Authentication failed. Check username/password in MONGODB_URI');
+    } else if (error.message.includes('ENOTFOUND') || error.message.includes('getaddrinfo')) {
+      console.error('   🌐 Issue: DNS resolution failed. Check cluster hostname in MONGODB_URI');
+    } else if (error.message.includes('timeout')) {
+      console.error('   ⏱️  Issue: Connection timeout. Check network/firewall settings');
+      console.error('   💡 Tip: Ensure your IP is whitelisted in MongoDB Atlas Network Access');
+    } else if (error.message.includes('ECONNREFUSED')) {
+      console.error('   🚫 Issue: Connection refused. Check MongoDB Atlas cluster status');
+    } else if (error.message.includes('SSL') || error.message.includes('TLS') || error.message.includes('tlsv1')) {
+      console.error('   🔒 Issue: SSL/TLS connection error');
+      console.error('   💡 Possible causes:');
+      console.error('      - Node.js version compatibility issue (try Node.js 18+)');
+      console.error('      - OpenSSL version mismatch');
+      console.error('      - Network/firewall blocking SSL handshake');
+      console.error('      - MongoDB Atlas cluster SSL configuration');
+      console.error('   🔧 Try: Update Node.js or check MongoDB Atlas connection string');
+    }
+    
+    console.error(`   Full error: ${error.stack || error}`);
+    console.error('');
+    console.error('💡 Troubleshooting steps:');
+    console.error('   1. Verify MONGODB_URI in server/.env file');
+    console.error('   2. Check MongoDB Atlas cluster is running');
+    console.error('   3. Ensure your IP is whitelisted in MongoDB Atlas Network Access');
+    console.error('   4. Verify database user credentials are correct');
+    console.error('   5. Check MongoDB Atlas connection string format');
   }
 }
 
@@ -732,6 +798,65 @@ app.get('/api/health', (req, res) => {
       solana: !!solanaConnection
     }
   });
+});
+
+// Debug endpoint for MongoDB connection details
+app.get('/api/debug/mongodb', async (req, res) => {
+  try {
+    const mongoUri = process.env.MONGODB_URI || 'not set';
+    const uriParts = mongoUri.split('@');
+    const displayUri = uriParts.length > 1 
+      ? `mongodb+srv://***@${uriParts[1]}` 
+      : 'mongodb+srv://***';
+    
+    const debugInfo = {
+      connected: !!db,
+      uriConfigured: !!process.env.MONGODB_URI,
+      uriDisplay: displayUri,
+      databaseName: 'memoryglass',
+      hasMongoClient: !!mongoClient,
+    };
+    
+    if (db) {
+      try {
+        // Test connection
+        await mongoClient.db('admin').command({ ping: 1 });
+        debugInfo.ping = 'success';
+        
+        // Get collections
+        const collections = await db.listCollections().toArray();
+        debugInfo.collections = collections.map(c => c.name);
+        debugInfo.collectionCount = collections.length;
+        
+        // Get database stats
+        const stats = await db.stats();
+        debugInfo.stats = {
+          collections: stats.collections,
+          dataSize: stats.dataSize,
+          storageSize: stats.storageSize
+        };
+      } catch (testError) {
+        debugInfo.ping = 'failed';
+        debugInfo.pingError = testError.message;
+      }
+    } else {
+      debugInfo.error = 'Database not connected';
+      debugInfo.troubleshooting = [
+        'Check server logs for connection errors',
+        'Verify MONGODB_URI in server/.env file',
+        'Ensure MongoDB Atlas cluster is running',
+        'Check IP whitelist in MongoDB Atlas Network Access',
+        'Verify database user credentials'
+      ];
+    }
+    
+    res.json(debugInfo);
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+      stack: error.stack
+    });
+  }
 });
 
 // Upload video
