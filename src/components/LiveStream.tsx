@@ -209,11 +209,21 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
       }
     } catch (error) {
       console.error('Error answering question:', error);
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Unable to generate answer at this time.';
+      
       setQuestions(prev => prev.map(q => 
         q.timestamp === question.timestamp 
-          ? { ...q, answer: 'Unable to generate answer at this time.', answered: true }
+          ? { ...q, answer: errorMessage, answered: true }
           : q
       ));
+      
+      toast({
+        title: "Error",
+        description: errorMessage,
+        variant: "destructive",
+      });
     } finally {
       setIsProcessing(false);
     }

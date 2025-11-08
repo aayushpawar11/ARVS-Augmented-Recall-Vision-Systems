@@ -1161,6 +1161,14 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
       });
     }
 
+    // Check if Gemini is initialized
+    if (!genAI) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return res.status(500).json({ 
+        error: 'Gemini AI not initialized. Please check your GEMINI_API_KEY in .env file.' 
+      });
+    }
+
     const videoPath = req.file.path;
     const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
     const videoData = await fs.readFile(videoPath);
@@ -1277,12 +1285,28 @@ Answer (2-3 sentences, be concise):`;
     });
   } catch (error) {
     console.error('Live answer error:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      code: error.code
+    });
     
     if (req.file?.path) {
       await fs.unlink(req.file.path).catch(() => {});
     }
     
-    res.status(500).json({ error: error.message });
+    // Provide more detailed error message
+    let errorMessage = 'Unable to generate answer at this time.';
+    if (error.message?.includes('API_KEY')) {
+      errorMessage = 'Invalid Gemini API key. Please check your GEMINI_API_KEY in .env file.';
+    } else if (error.message?.includes('quota') || error.message?.includes('limit')) {
+      errorMessage = 'API quota exceeded. Please check your Gemini API usage limits.';
+    } else if (error.message) {
+      errorMessage = `Error: ${error.message}`;
+    }
+    
+    res.status(500).json({ error: errorMessage });
   }
 });
 
