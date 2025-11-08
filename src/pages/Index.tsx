@@ -33,7 +33,7 @@ const Index = () => {
 
             {/* Description */}
             <p className="text-xl text-muted-foreground max-w-2xl mx-auto leading-relaxed">
-              AI-powered spatial memory for smart glasses. Ask where you left your keys, water bottle, or anything else—and get an instant answer with visual proof.
+              AI-powered spatial memory for smart glasses. Find objects you left behind, or ask questions about what happened in your videos—get instant answers with visual proof.
             </p>
 
             {/* CTA Buttons */}
@@ -122,9 +122,9 @@ const Index = () => {
               <div className="h-12 w-12 rounded-lg bg-primary/10 flex items-center justify-center mb-4 group-hover:bg-primary/20 transition-colors">
                 <Search className="h-6 w-6 text-primary" />
               </div>
-              <h3 className="text-lg font-semibold mb-2 text-foreground">Voice Search</h3>
+              <h3 className="text-lg font-semibold mb-2 text-foreground">Ask Questions</h3>
               <p className="text-sm text-muted-foreground">
-                Ask naturally and get instant answers with visual proof
+                Find objects or ask questions about your videos—get instant AI-powered answers
               </p>
             </Card>
           </div>
@@ -186,8 +186,32 @@ const Index = () => {
                       <div className="h-2 w-2 rounded-full bg-primary" />
                     </div>
                     <div>
-                      <div className="font-medium text-foreground">"When did I last see Sarah?"</div>
-                      <div className="text-sm text-muted-foreground">Tuesday at coffee shop, 3:45 PM</div>
+                      <div className="font-medium text-foreground">"What was I doing in the video?"</div>
+                      <div className="text-sm text-muted-foreground">You were working at your desk, typing on laptop</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-start gap-3">
+                    <div className="h-6 w-6 rounded-full bg-secondary/20 flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <div className="h-2 w-2 rounded-full bg-secondary" />
+                    </div>
+                    <div>
+                      <div className="font-medium text-foreground">"Who was in the video?"</div>
+                      <div className="text-sm text-muted-foreground">Two people: you and Sarah at the coffee shop</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-start gap-3">
+                    <div className="h-6 w-6 rounded-full bg-spatial-grid/20 flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <div className="h-2 w-2 rounded-full bg-spatial-grid" />
+                    </div>
+                    <div>
+                      <div className="font-medium text-foreground">"What happened at 2:30 PM?"</div>
+                      <div className="text-sm text-muted-foreground">You left the office and walked to your car</div>
                     </div>
                   </div>
                 </div>

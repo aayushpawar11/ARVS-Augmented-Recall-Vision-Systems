@@ -4,7 +4,7 @@ import multer from 'multer';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { config } from 'dotenv';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { createAssociatedTokenAccountInstruction, getAssociatedTokenAddress, createTransferInstruction } from '@solana/spl-token';
@@ -106,21 +106,30 @@ async function processVideoWithGemini(videoPath, userId) {
 
   const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
   const objects = [];
+  let videoSummary = null;
   
   try {
     // Read video file
     const videoData = await fs.readFile(videoPath);
     const base64Video = videoData.toString('base64');
     
-    // Analyze video with Gemini Vision
-    const prompt = `Analyze this video frame by frame and identify all objects visible. For each object, provide:
-    1. Object name/type
-    2. Approximate timestamp (if possible)
-    3. Location description (relative position in frame)
-    4. Confidence level
+    // Comprehensive video analysis prompt
+    const prompt = `Analyze this video comprehensively and provide:
     
-    Return as JSON array with format:
-    [{"object": "water bottle", "timestamp": "00:00:15", "location": "center-right, on desk", "confidence": 0.95}, ...]`;
+    1. OBJECTS: Identify all objects visible with their locations and timestamps
+    2. ACTIVITIES: Describe what activities or actions are happening
+    3. PEOPLE: Note any people present and their actions
+    4. SCENES: Describe different scenes or locations shown
+    5. SUMMARY: Provide a brief overall summary of the video content
+    
+    Return as JSON with format:
+    {
+      "objects": [{"object": "water bottle", "timestamp": "00:00:15", "location": "center-right, on desk", "confidence": 0.95}, ...],
+      "activities": [{"activity": "working at desk", "timestamp": "00:00:00-00:05:00", "description": "person typing on laptop"}],
+      "people": [{"description": "person in blue shirt", "actions": ["typing", "drinking water"], "timestamp": "00:00:00"}],
+      "scenes": [{"scene": "office desk", "timestamp": "00:00:00", "description": "cluttered desk with laptop and water bottle"}],
+      "summary": "Video shows a person working at a desk with various objects including a water bottle, laptop, and papers. The person is typing and occasionally drinks water."
+    }`;
 
     const result = await model.generateContent([
       prompt,
@@ -136,13 +145,14 @@ async function processVideoWithGemini(videoPath, userId) {
     const text = response.text();
     
     // Parse JSON from response
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      objects.push(...parsed);
+      objects.push(...(parsed.objects || []));
+      videoSummary = parsed;
     }
 
-    // Store in MongoDB
+    // Store in MongoDB with enhanced data
     const videoDoc = {
       userId,
       videoPath,
@@ -152,6 +162,10 @@ async function processVideoWithGemini(videoPath, userId) {
         ...obj,
         detectedAt: new Date()
       })),
+      activities: videoSummary?.activities || [],
+      people: videoSummary?.people || [],
+      scenes: videoSummary?.scenes || [],
+      summary: videoSummary?.summary || '',
       processed: true
     };
 
@@ -162,10 +176,11 @@ async function processVideoWithGemini(videoPath, userId) {
       event: 'video_processed',
       userId,
       objectCount: objects.length,
+      activityCount: videoSummary?.activities?.length || 0,
       timestamp: new Date()
     });
 
-    return objects;
+    return { objects, summary: videoSummary };
   } catch (error) {
     console.error('Error processing video:', error);
     throw error;
@@ -195,6 +210,24 @@ async function sendToSnowflake(data) {
   }
 }
 
+// Determine query type: object location vs general question
+function detectQueryType(query) {
+  const lowerQuery = query.toLowerCase();
+  const locationKeywords = ['where', 'left', 'placed', 'put', 'location', 'position'];
+  const questionKeywords = ['what', 'who', 'when', 'how', 'why', 'did', 'was', 'were', 'happened', 'doing'];
+  
+  const hasLocationKeyword = locationKeywords.some(kw => lowerQuery.includes(kw));
+  const hasQuestionKeyword = questionKeywords.some(kw => lowerQuery.includes(kw));
+  
+  // If it's asking "where did I leave X" or "where is X", it's a location query
+  if (hasLocationKeyword && (lowerQuery.includes('leave') || lowerQuery.includes('is') || lowerQuery.includes('did'))) {
+    return 'location';
+  }
+  
+  // Otherwise, treat as general question
+  return 'general';
+}
+
 // Query objects using Gemini for natural language understanding
 async function queryObjects(userId, query) {
   if (!genAI) {
@@ -217,20 +250,27 @@ Available video data:
 ${JSON.stringify(videos.map(v => ({
   filename: v.filename,
   uploadedAt: v.uploadedAt,
-  objects: v.objects
+  objects: v.objects,
+  activities: v.activities || [],
+  people: v.people || [],
+  scenes: v.scenes || [],
+  summary: v.summary || ''
 })), null, 2)}
 
-Analyze the query and find the most relevant object matches. Return JSON with:
+Analyze the query and find the most relevant matches. Return JSON with:
 {
-  "object": "extracted object name",
+  "queryType": "location or general",
+  "object": "extracted object name (if location query)",
+  "answer": "detailed answer to the question",
   "matches": [
     {
       "videoId": "video document id",
       "filename": "video filename",
       "timestamp": "detected timestamp",
-      "location": "location description",
+      "location": "location description (if location query)",
       "confidence": 0.95,
-      "uploadedAt": "ISO date string"
+      "uploadedAt": "ISO date string",
+      "relevantInfo": "relevant information from this video"
     }
   ],
   "bestMatch": { ... most recent/relevant match ... }
@@ -250,14 +290,155 @@ Analyze the query and find the most relevant object matches. Return JSON with:
   
   // Log query to Snowflake
   await sendToSnowflake({
-    event: 'object_query',
+    event: 'video_query',
     userId,
     query,
-    objectFound: parsed.matches?.length > 0,
+    queryType: parsed.queryType || 'general',
+    found: parsed.matches?.length > 0,
     timestamp: new Date()
   });
 
   return parsed;
+}
+
+// Answer general questions about video content
+async function answerVideoQuestion(userId, query, videoId = null) {
+  if (!genAI) {
+    throw new Error('Gemini AI not initialized');
+  }
+
+  let videos;
+  
+  if (videoId) {
+    // Answer question about specific video
+    const video = await db.collection('videos').findOne({ 
+      userId, 
+      _id: ObjectId.isValid(videoId) ? new ObjectId(videoId) : videoId
+    });
+    if (!video) {
+      throw new Error('Video not found');
+    }
+    videos = [video];
+  } else {
+    // Answer question across all videos
+    videos = await db.collection('videos')
+      .find({ userId })
+      .sort({ uploadedAt: -1 })
+      .limit(10)
+      .toArray();
+  }
+
+  if (videos.length === 0) {
+    return {
+      answer: "I don't have any videos to analyze yet. Please upload a video first.",
+      queryType: 'general',
+      matches: []
+    };
+  }
+
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+  
+  // For specific video questions, analyze the actual video
+  if (videoId && videos[0].videoPath) {
+    try {
+      const videoData = await fs.readFile(videos[0].videoPath);
+      const base64Video = videoData.toString('base64');
+      
+      const prompt = `User question: "${query}"
+
+Analyze this video and answer the question in detail. Provide:
+1. A clear, comprehensive answer
+2. Relevant timestamps where the answer can be found
+3. Any important details or context
+
+Answer:`;
+
+      const result = await model.generateContent([
+        prompt,
+        {
+          inlineData: {
+            mimeType: 'video/mp4',
+            data: base64Video
+          }
+        }
+      ]);
+
+      const response = await result.response;
+      const answer = response.text();
+      
+      return {
+        answer,
+        queryType: 'general',
+        videoId: videoId,
+        filename: videos[0].filename,
+        matches: [{
+          videoId: videoId,
+          filename: videos[0].filename,
+          relevantInfo: answer,
+          uploadedAt: videos[0].uploadedAt
+        }]
+      };
+    } catch (error) {
+      console.error('Error analyzing video directly:', error);
+      // Fall through to metadata-based answer
+    }
+  }
+
+  // Use video metadata to answer
+  const prompt = `User question: "${query}"
+
+Video information:
+${JSON.stringify(videos.map(v => ({
+  filename: v.filename,
+  uploadedAt: v.uploadedAt,
+  summary: v.summary || '',
+  objects: v.objects || [],
+  activities: v.activities || [],
+  people: v.people || [],
+  scenes: v.scenes || []
+})), null, 2)}
+
+Answer the question based on the video information provided. Be specific and reference which video(s) contain the answer. Return JSON:
+{
+  "answer": "detailed answer to the question",
+  "matches": [
+    {
+      "videoId": "video id",
+      "filename": "video filename",
+      "relevantInfo": "specific information from this video",
+      "timestamp": "relevant timestamp if available",
+      "uploadedAt": "ISO date"
+    }
+  ],
+  "bestMatch": { ... most relevant match ... }
+}`;
+
+  const result = await model.generateContent(prompt);
+  const response = await result.response;
+  const text = response.text();
+  
+  // Parse JSON response
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    const parsed = JSON.parse(jsonMatch[0]);
+    return {
+      answer: parsed.answer || text,
+      queryType: 'general',
+      matches: parsed.matches || [],
+      bestMatch: parsed.bestMatch
+    };
+  }
+
+  // Fallback: return text as answer
+  return {
+    answer: text,
+    queryType: 'general',
+    matches: videos.map(v => ({
+      videoId: v._id.toString(),
+      filename: v.filename,
+      uploadedAt: v.uploadedAt
+    }))
+  };
 }
 
 // Generate voice response with ElevenLabs
@@ -374,27 +555,42 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
   }
 });
 
-// Query for objects
+// Query for objects or answer questions
 app.post('/api/query', async (req, res) => {
   try {
-    const { userId, query } = req.body;
+    const { userId, query, videoId } = req.body;
 
     if (!query) {
       return res.status(400).json({ error: 'Query is required' });
     }
 
-    const result = await queryObjects(userId || 'anonymous', query);
-    
-    // Generate voice response
-    const responseText = result.bestMatch 
-      ? `I found your ${result.object}. It was last seen ${result.bestMatch.location} at ${new Date(result.bestMatch.uploadedAt).toLocaleTimeString()}.`
-      : `I couldn't find ${result.object} in your recent memories.`;
+    const queryType = detectQueryType(query);
+    let result;
 
-    const voiceAudio = await generateVoiceResponse(responseText);
+    if (queryType === 'location') {
+      // Object location query
+      result = await queryObjects(userId || 'anonymous', query);
+      
+      // Generate voice response for location queries
+      const responseText = result.bestMatch 
+        ? `I found your ${result.object || 'item'}. It was last seen ${result.bestMatch.location} at ${new Date(result.bestMatch.uploadedAt).toLocaleTimeString()}.`
+        : `I couldn't find ${result.object || 'that item'} in your recent memories.`;
+      
+      result.responseText = responseText;
+    } else {
+      // General question about video content
+      result = await answerVideoQuestion(userId || 'anonymous', query, videoId);
+      
+      // Generate voice response for general questions
+      result.responseText = result.answer || 'I couldn\'t find an answer to that question in your videos.';
+    }
+
+    // Generate voice audio
+    const voiceAudio = await generateVoiceResponse(result.responseText);
 
     res.json({
       ...result,
-      responseText,
+      queryType: result.queryType || queryType,
       voiceAudio: voiceAudio ? `data:audio/mpeg;base64,${voiceAudio}` : null
     });
   } catch (error) {

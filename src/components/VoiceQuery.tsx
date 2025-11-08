@@ -7,22 +7,26 @@ import { useToast } from "@/hooks/use-toast";
 import { API_ENDPOINTS } from "@/config/api";
 
 interface QueryResult {
-  object: string;
+  queryType?: 'location' | 'general';
+  object?: string;
+  answer?: string;
   matches: Array<{
-    videoId: string;
+    videoId?: string;
     filename: string;
-    timestamp: string;
-    location: string;
-    confidence: number;
+    timestamp?: string;
+    location?: string;
+    confidence?: number;
     uploadedAt: string;
+    relevantInfo?: string;
   }>;
   bestMatch?: {
-    videoId: string;
+    videoId?: string;
     filename: string;
-    timestamp: string;
-    location: string;
-    confidence: number;
+    timestamp?: string;
+    location?: string;
+    confidence?: number;
     uploadedAt: string;
+    relevantInfo?: string;
   };
   responseText: string;
   voiceAudio?: string;
@@ -74,8 +78,10 @@ export const VoiceQuery = ({ userId = "user-1", onResult }: VoiceQueryProps) => 
         }
 
         toast({
-          title: data.bestMatch ? "Found it!" : "Not found",
-          description: data.responseText,
+          title: data.queryType === 'location' 
+            ? (data.bestMatch ? "Found it!" : "Not found")
+            : (data.answer ? "Answer found!" : "No answer found"),
+          description: data.responseText || data.answer || "Query processed",
         });
       } else {
         throw new Error(data.error || 'Query failed');
@@ -143,15 +149,15 @@ export const VoiceQuery = ({ userId = "user-1", onResult }: VoiceQueryProps) => 
             <Search className="h-5 w-5 text-primary" />
           </div>
           <div>
-            <h3 className="font-semibold text-foreground">Ask Where You Left Something</h3>
-            <p className="text-sm text-muted-foreground">Natural language search powered by Gemini AI</p>
+            <h3 className="font-semibold text-foreground">Ask Questions About Your Videos</h3>
+            <p className="text-sm text-muted-foreground">Find objects or ask questions - powered by Gemini AI</p>
           </div>
         </div>
 
         <div className="flex gap-2">
           <Input
             type="text"
-            placeholder='e.g., "Where did I leave my water bottle?"'
+            placeholder='e.g., "Where did I leave my water bottle?" or "What was I doing in the video?"'
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
@@ -182,12 +188,25 @@ export const VoiceQuery = ({ userId = "user-1", onResult }: VoiceQueryProps) => 
         {result && (
           <div className="mt-4 p-4 rounded-lg bg-primary/5 border border-primary/20 space-y-3">
             <div className="flex items-start justify-between">
-              <div>
-                <p className="font-medium text-foreground">Found: {result.object}</p>
-                {result.bestMatch && (
-                  <p className="text-sm text-muted-foreground mt-1">
-                    {result.responseText}
-                  </p>
+              <div className="flex-1">
+                {result.queryType === 'location' ? (
+                  <>
+                    <p className="font-medium text-foreground">
+                      {result.object ? `Found: ${result.object}` : 'Search Results'}
+                    </p>
+                    {result.bestMatch && (
+                      <p className="text-sm text-muted-foreground mt-1">
+                        {result.responseText}
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <p className="font-medium text-foreground mb-2">Answer:</p>
+                    <p className="text-sm text-foreground leading-relaxed">
+                      {result.answer || result.responseText}
+                    </p>
+                  </>
                 )}
               </div>
               {result.voiceAudio && (
@@ -196,6 +215,7 @@ export const VoiceQuery = ({ userId = "user-1", onResult }: VoiceQueryProps) => 
                   size="icon"
                   onClick={() => playAudio(result.voiceAudio!)}
                   disabled={isPlayingAudio}
+                  className="flex-shrink-0"
                 >
                   <Volume2 className="h-4 w-4" />
                 </Button>
@@ -204,17 +224,34 @@ export const VoiceQuery = ({ userId = "user-1", onResult }: VoiceQueryProps) => 
 
             {result.bestMatch && (
               <div className="text-xs space-y-1 text-muted-foreground">
-                <p>📍 Location: {result.bestMatch.location}</p>
-                <p>🕐 Time: {new Date(result.bestMatch.uploadedAt).toLocaleString()}</p>
-                <p>📹 Video: {result.bestMatch.filename}</p>
-                <p>🎯 Confidence: {(result.bestMatch.confidence * 100).toFixed(0)}%</p>
+                {result.queryType === 'location' ? (
+                  <>
+                    {result.bestMatch.location && <p>📍 Location: {result.bestMatch.location}</p>}
+                    <p>🕐 Time: {new Date(result.bestMatch.uploadedAt).toLocaleString()}</p>
+                    <p>📹 Video: {result.bestMatch.filename}</p>
+                    {result.bestMatch.confidence && (
+                      <p>🎯 Confidence: {(result.bestMatch.confidence * 100).toFixed(0)}%</p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <p>📹 Video: {result.bestMatch.filename}</p>
+                    <p>🕐 Recorded: {new Date(result.bestMatch.uploadedAt).toLocaleString()}</p>
+                    {result.bestMatch.timestamp && (
+                      <p>⏱️ Timestamp: {result.bestMatch.timestamp}</p>
+                    )}
+                    {result.bestMatch.relevantInfo && (
+                      <p className="mt-2 text-foreground/80">{result.bestMatch.relevantInfo}</p>
+                    )}
+                  </>
+                )}
               </div>
             )}
 
             {result.matches && result.matches.length > 1 && (
               <div className="pt-2 border-t border-primary/10">
                 <p className="text-xs text-muted-foreground">
-                  Found {result.matches.length} total matches
+                  Found {result.matches.length} total {result.queryType === 'location' ? 'matches' : 'relevant videos'}
                 </p>
               </div>
             )}
