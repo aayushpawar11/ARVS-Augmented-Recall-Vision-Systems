@@ -907,6 +907,424 @@ app.get('/api/video/:videoId/questions', async (req, res) => {
   }
 });
 
+// Rate limiting for live answers (prevent API spam)
+const liveAnswerCache = new Map();
+const RATE_LIMIT_WINDOW = 5000; // 5 seconds
+const MAX_QUESTIONS_PER_WINDOW = 3;
+
+// Live stream session memory - stores video chunk metadata during active streams
+const liveStreamSessions = new Map(); // userId -> session data
+
+// Clean up old sessions (older than 1 hour)
+setInterval(() => {
+  const oneHourAgo = Date.now() - (60 * 60 * 1000);
+  for (const [userId, session] of liveStreamSessions.entries()) {
+    if (session.lastActivity < oneHourAgo) {
+      liveStreamSessions.delete(userId);
+      console.log(`🧹 Cleaned up old session for user: ${userId}`);
+    }
+  }
+}, 5 * 60 * 1000); // Run every 5 minutes
+
+// Initialize or get live stream session
+function getLiveStreamSession(userId) {
+  if (!liveStreamSessions.has(userId)) {
+    liveStreamSessions.set(userId, {
+      userId,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      chunks: [], // Video chunks with metadata
+      objects: [], // All detected objects with timestamps
+      activities: [], // Activities with timestamps
+      scenes: [] // Scene changes
+    });
+  }
+  const session = liveStreamSessions.get(userId);
+  session.lastActivity = Date.now();
+  return session;
+}
+
+// Analyze video chunk and extract objects/activities (lightweight analysis)
+// Only analyzes every Nth chunk to save API costs (configurable)
+const CHUNK_ANALYSIS_INTERVAL = 2; // Analyze every 2nd chunk (~6 seconds of video)
+
+async function analyzeVideoChunkForMemory(videoPath, session) {
+  if (!genAI) return;
+
+  // Skip analysis if we've analyzed too recently (throttle to save API costs)
+  const lastAnalysis = session.lastChunkAnalysis || 0;
+  const timeSinceLastAnalysis = Date.now() - lastAnalysis;
+  const minInterval = 6000; // Analyze at most every 6 seconds
+
+  if (timeSinceLastAnalysis < minInterval && session.chunks.length > 0) {
+    // Just store chunk metadata without analysis
+    const timestamp = Date.now();
+    const relativeTime = Math.floor((timestamp - session.startedAt) / 1000);
+    session.chunks.push({
+      timestamp,
+      relativeTime,
+      objects: [],
+      activity: 'Not analyzed (throttled)'
+    });
+    return;
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    const videoData = await fs.readFile(videoPath);
+    const base64Video = videoData.toString('base64');
+
+    // Lightweight analysis - just extract objects and key activities
+    const prompt = `Analyze this short video segment (3 seconds) and extract ONLY:
+    
+1. OBJECTS: List visible objects with locations (max 10 most prominent)
+2. KEY_ACTIVITY: One sentence describing what's happening
+
+Return JSON:
+{
+  "objects": [{"object": "water bottle", "location": "on desk", "confidence": 0.9}],
+  "activity": "Person working at desk"
+}`;
+
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          mimeType: 'video/webm',
+          data: base64Video
+        }
+      }
+    ]);
+
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const timestamp = Date.now();
+      const relativeTime = Math.floor((timestamp - session.startedAt) / 1000);
+
+      // Add to session memory
+      if (parsed.objects && parsed.objects.length > 0) {
+        parsed.objects.forEach(obj => {
+          session.objects.push({
+            object: obj.object,
+            location: obj.location,
+            confidence: obj.confidence || 0.7,
+            timestamp,
+            relativeTime: `${Math.floor(relativeTime / 60)}:${String(relativeTime % 60).padStart(2, '0')}`,
+            chunkIndex: session.chunks.length
+          });
+        });
+      }
+
+      if (parsed.activity) {
+        session.activities.push({
+          activity: parsed.activity,
+          timestamp,
+          relativeTime: `${Math.floor(relativeTime / 60)}:${String(relativeTime % 60).padStart(2, '0')}`,
+          chunkIndex: session.chunks.length
+        });
+      }
+
+      session.chunks.push({
+        timestamp,
+        relativeTime,
+        objects: parsed.objects || [],
+        activity: parsed.activity
+      });
+
+      session.lastChunkAnalysis = timestamp;
+
+      // Keep only last 20 minutes of memory (to prevent unbounded growth)
+      const twentyMinutesAgo = timestamp - (20 * 60 * 1000);
+      session.objects = session.objects.filter(obj => obj.timestamp > twentyMinutesAgo);
+      session.activities = session.activities.filter(act => act.timestamp > twentyMinutesAgo);
+      session.chunks = session.chunks.filter(chunk => chunk.timestamp > twentyMinutesAgo);
+    }
+  } catch (error) {
+    console.error('Error analyzing chunk for memory:', error);
+    // Still store chunk metadata even if analysis fails
+    const timestamp = Date.now();
+    const relativeTime = Math.floor((timestamp - session.startedAt) / 1000);
+    session.chunks.push({
+      timestamp,
+      relativeTime,
+      objects: [],
+      activity: 'Analysis failed'
+    });
+  }
+}
+
+// Start live stream session
+app.post('/api/live-stream/start', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const session = getLiveStreamSession(userId || 'anonymous');
+    
+    res.json({
+      success: true,
+      sessionId: session.userId,
+      startedAt: session.startedAt,
+      message: 'Live stream session started'
+    });
+  } catch (error) {
+    console.error('Error starting live stream session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Store video chunk in session memory (background processing)
+app.post('/api/live-stream/chunk', upload.single('video'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video chunk provided' });
+    }
+
+    const { userId } = req.body;
+    const session = getLiveStreamSession(userId || 'anonymous');
+    const videoPath = req.file.path;
+
+    // Analyze chunk in background (non-blocking)
+    analyzeVideoChunkForMemory(videoPath, session)
+      .then(() => {
+        // Clean up file after analysis
+        fs.unlink(videoPath).catch(() => {});
+      })
+      .catch(err => {
+        console.error('Error processing chunk:', err);
+        fs.unlink(videoPath).catch(() => {});
+      });
+
+    // Return immediately - processing happens in background
+    res.json({
+      success: true,
+      chunkIndex: session.chunks.length,
+      memorySize: {
+        objects: session.objects.length,
+        activities: session.activities.length
+      }
+    });
+  } catch (error) {
+    console.error('Error storing chunk:', error);
+    if (req.file?.path) {
+      await fs.unlink(req.file.path).catch(() => {});
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Live stream question answering with memory (optimized for real-time)
+app.post('/api/live-answer', upload.single('video'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video chunk provided' });
+    }
+
+    const { question, userId, timestamp } = req.body;
+
+    if (!question) {
+      return res.status(400).json({ error: 'Question is required' });
+    }
+
+    // Get or create session
+    const session = getLiveStreamSession(userId || 'anonymous');
+
+    // Rate limiting - prevent too many API calls
+    const userKey = `${userId}-${Date.now() - (Date.now() % RATE_LIMIT_WINDOW)}`;
+    const userRequests = liveAnswerCache.get(userKey) || 0;
+    
+    if (userRequests >= MAX_QUESTIONS_PER_WINDOW) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return res.status(429).json({ 
+        error: 'Too many questions. Please wait a few seconds.',
+        retryAfter: RATE_LIMIT_WINDOW / 1000
+      });
+    }
+
+    liveAnswerCache.set(userKey, userRequests + 1);
+    setTimeout(() => liveAnswerCache.delete(userKey), RATE_LIMIT_WINDOW);
+
+    // Check for duplicate questions
+    const questionHash = question.toLowerCase().trim().substring(0, 50);
+    const cacheKey = `${userId}-${questionHash}`;
+    const cached = liveAnswerCache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.timestamp) < 10000) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return res.json({
+        answer: cached.answer,
+        question,
+        timestamp: timestamp ? parseInt(timestamp) : Date.now(),
+        cached: true
+      });
+    }
+
+    const videoPath = req.file.path;
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    const videoData = await fs.readFile(videoPath);
+    const base64Video = videoData.toString('base64');
+
+    // Check if question is about past/memory (e.g., "did I leave", "a few minutes ago", "earlier")
+    const lowerQuestion = question.toLowerCase();
+    const isMemoryQuestion = lowerQuestion.includes('did i') || 
+                            lowerQuestion.includes('left') || 
+                            lowerQuestion.includes('ago') || 
+                            lowerQuestion.includes('earlier') ||
+                            lowerQuestion.includes('before') ||
+                            lowerQuestion.includes('minutes ago') ||
+                            lowerQuestion.includes('was there');
+
+    let prompt;
+    let memoryContext = '';
+
+    if (isMemoryQuestion && session.objects.length > 0) {
+      // Memory-based question - use session history
+      const recentObjects = session.objects
+        .slice(-50) // Last 50 objects
+        .map(obj => ({
+          object: obj.object,
+          location: obj.location,
+          time: obj.relativeTime,
+          confidence: obj.confidence
+        }));
+
+      const recentActivities = session.activities
+        .slice(-20) // Last 20 activities
+        .map(act => ({
+          activity: act.activity,
+          time: act.relativeTime
+        }));
+
+      memoryContext = `
+Session Memory (from last ${Math.floor((Date.now() - session.startedAt) / 60000)} minutes):
+Objects seen: ${JSON.stringify(recentObjects, null, 2)}
+Activities: ${JSON.stringify(recentActivities, null, 2)}
+`;
+
+      prompt = `Question: "${question}"
+
+${memoryContext}
+
+Current video context (what's visible NOW):
+[Analyze the current video segment]
+
+Answer the question by combining:
+1. Current video context (what's visible right now)
+2. Session memory (what happened in the last few minutes)
+
+If the question asks about something from the past (like "did I leave X"), search through the session memory.
+If asking about current state, focus on the current video.
+
+Provide a clear, concise answer (2-3 sentences):`;
+    } else {
+      // Current context question
+      prompt = `Question: "${question}"
+
+Analyze this short video segment (last few seconds) and answer the question.
+Focus on what is visible RIGHT NOW in the video.
+
+Answer (2-3 sentences, be concise):`;
+    }
+
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          mimeType: 'video/webm',
+          data: base64Video
+        }
+      }
+    ]);
+
+    const response = await result.response;
+    const answer = response.text().trim();
+
+    // Cache the answer
+    liveAnswerCache.set(cacheKey, {
+      answer,
+      timestamp: Date.now()
+    });
+
+    // Generate voice response
+    const voiceAudio = await generateVoiceResponse(answer);
+
+    // Clean up file
+    await fs.unlink(videoPath).catch(() => {});
+
+    // Log to Snowflake
+    await sendToSnowflake({
+      event: 'live_question_answered',
+      userId,
+      questionType: isMemoryQuestion ? 'memory' : 'current',
+      questionLength: question.length,
+      answerLength: answer.length,
+      memoryObjectsUsed: isMemoryQuestion ? session.objects.length : 0,
+      timestamp: new Date()
+    });
+
+    res.json({
+      answer,
+      question,
+      timestamp: timestamp ? parseInt(timestamp) : Date.now(),
+      voiceAudio: voiceAudio ? `data:audio/mpeg;base64,${voiceAudio}` : null,
+      usedMemory: isMemoryQuestion,
+      memoryContext: isMemoryQuestion ? {
+        objectsFound: session.objects.length,
+        activitiesFound: session.activities.length
+      } : null
+    });
+  } catch (error) {
+    console.error('Live answer error:', error);
+    
+    if (req.file?.path) {
+      await fs.unlink(req.file.path).catch(() => {});
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// End live stream session
+app.post('/api/live-stream/end', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (liveStreamSessions.has(userId || 'anonymous')) {
+      const session = liveStreamSessions.get(userId || 'anonymous');
+      const duration = Math.floor((Date.now() - session.startedAt) / 1000);
+      
+      // Optionally save session to MongoDB for later reference
+      if (session.objects.length > 0 || session.activities.length > 0) {
+        await db.collection('live_sessions').insertOne({
+          userId: userId || 'anonymous',
+          startedAt: new Date(session.startedAt),
+          endedAt: new Date(),
+          duration: duration,
+          objects: session.objects.slice(-100), // Keep last 100 objects
+          activities: session.activities.slice(-50), // Keep last 50 activities
+          chunksProcessed: session.chunks.length
+        });
+      }
+      
+      liveStreamSessions.delete(userId || 'anonymous');
+      
+      res.json({
+        success: true,
+        duration: duration,
+        objectsDetected: session.objects.length,
+        activitiesDetected: session.activities.length
+      });
+    } else {
+      res.json({ success: true, message: 'No active session found' });
+    }
+  } catch (error) {
+    console.error('Error ending live stream session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Mint memory NFT
 app.post('/api/mint-nft', async (req, res) => {
   try {

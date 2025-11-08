@@ -3,6 +3,7 @@ import { VideoUpload } from "@/components/VideoUpload";
 import { VoiceQuery } from "@/components/VoiceQuery";
 import { MemoryResults } from "@/components/MemoryResults";
 import { VideoQuestions } from "@/components/VideoQuestions";
+import { LiveStream } from "@/components/LiveStream";
 import { Card } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Brain, Database, Coins, BarChart3 } from "lucide-react";
@@ -89,11 +90,16 @@ const Dashboard = () => {
           </div>
 
           {/* Main Content */}
-          <Tabs defaultValue="upload" className="space-y-6">
-            <TabsList className="grid w-full grid-cols-2">
+          <Tabs defaultValue="live" className="space-y-6">
+            <TabsList className="grid w-full grid-cols-3">
+              <TabsTrigger value="live">Live Stream</TabsTrigger>
               <TabsTrigger value="upload">Upload Video</TabsTrigger>
               <TabsTrigger value="search">Search Memories</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="live" className="space-y-6">
+              <LiveStream userId={userId} />
+            </TabsContent>
 
             <TabsContent value="upload" className="space-y-6">
               <VideoUpload 
