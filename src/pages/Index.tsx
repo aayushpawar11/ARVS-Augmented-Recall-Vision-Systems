@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Brain, Eye, MapPin, Zap, Upload, Search } from "lucide-react";
+import { Link } from "react-router-dom";
 
 const Index = () => {
   return (
@@ -37,22 +38,26 @@ const Index = () => {
 
             {/* CTA Buttons */}
             <div className="flex flex-col sm:flex-row gap-4 justify-center pt-4">
-              <Button 
-                size="lg" 
-                className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-neural group relative overflow-hidden"
-              >
-                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000" />
-                <Upload className="mr-2 h-5 w-5" />
-                Upload Memory Footage
-              </Button>
-              <Button 
-                size="lg" 
-                variant="outline"
-                className="border-primary/20 hover:bg-primary/5 backdrop-blur-sm"
-              >
-                <Search className="mr-2 h-5 w-5" />
-                Search Your Memories
-              </Button>
+              <Link to="/dashboard">
+                <Button 
+                  size="lg" 
+                  className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-neural group relative overflow-hidden"
+                >
+                  <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000" />
+                  <Upload className="mr-2 h-5 w-5" />
+                  Upload Memory Footage
+                </Button>
+              </Link>
+              <Link to="/dashboard">
+                <Button 
+                  size="lg" 
+                  variant="outline"
+                  className="border-primary/20 hover:bg-primary/5 backdrop-blur-sm"
+                >
+                  <Search className="mr-2 h-5 w-5" />
+                  Search Your Memories
+                </Button>
+              </Link>
             </div>
 
             {/* Stats */}
