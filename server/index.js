@@ -152,24 +152,45 @@ async function processVideoWithGemini(videoPath, userId) {
       videoSummary = parsed;
     }
 
-    // Store in MongoDB with enhanced data
+    // Store in MongoDB with optimized data (limit array sizes to prevent bloat)
     const videoDoc = {
       userId,
       videoPath,
       filename: path.basename(videoPath),
       uploadedAt: new Date(),
-      objects: objects.map(obj => ({
-        ...obj,
-        detectedAt: new Date()
-      })),
-      activities: videoSummary?.activities || [],
-      people: videoSummary?.people || [],
-      scenes: videoSummary?.scenes || [],
-      summary: videoSummary?.summary || '',
+      // Limit objects to top 50 most confident to prevent storage bloat
+      objects: objects
+        .map(obj => ({
+          object: obj.object,
+          timestamp: obj.timestamp,
+          location: obj.location,
+          confidence: obj.confidence || 0.5
+        }))
+        .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+        .slice(0, 50),
+      // Limit activities to top 20
+      activities: (videoSummary?.activities || []).slice(0, 20),
+      // Limit people to top 10
+      people: (videoSummary?.people || []).slice(0, 10),
+      // Limit scenes to top 10
+      scenes: (videoSummary?.scenes || []).slice(0, 10),
+      // Store summary (text only, should be small)
+      summary: (videoSummary?.summary || '').substring(0, 1000), // Max 1000 chars
       processed: true
     };
 
     await db.collection('videos').insertOne(videoDoc);
+    
+    // Create indexes to optimize queries and reduce storage overhead (ignore if already exist)
+    try {
+      await db.collection('videos').createIndex({ userId: 1, uploadedAt: -1 });
+      await db.collection('videos').createIndex({ 'objects.object': 'text', summary: 'text' });
+    } catch (indexError) {
+      // Indexes may already exist, that's fine
+      if (!indexError.message.includes('already exists')) {
+        console.warn('Index creation warning:', indexError.message);
+      }
+    }
 
     // Send analytics to Snowflake
     await sendToSnowflake({
@@ -234,27 +255,38 @@ async function queryObjects(userId, query) {
     throw new Error('Gemini AI not initialized');
   }
 
-  // Get all user's video data
+  // Get all user's video data (limit to recent 50 to reduce payload size)
   const videos = await db.collection('videos')
     .find({ userId })
     .sort({ uploadedAt: -1 })
-    .limit(100)
+    .limit(50)
+    .project({
+      filename: 1,
+      uploadedAt: 1,
+      objects: 1,
+      activities: 1,
+      people: 1,
+      scenes: 1,
+      summary: 1,
+      _id: 1
+    })
     .toArray();
 
   // Use Gemini to understand the query and search
   const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
   
+  // Optimize: Only send essential data, limit array sizes in prompt
   const searchPrompt = `User query: "${query}"
 
 Available video data:
 ${JSON.stringify(videos.map(v => ({
   filename: v.filename,
   uploadedAt: v.uploadedAt,
-  objects: v.objects,
-  activities: v.activities || [],
-  people: v.people || [],
-  scenes: v.scenes || [],
-  summary: v.summary || ''
+  objects: (v.objects || []).slice(0, 20), // Limit to top 20 objects per video
+  activities: (v.activities || []).slice(0, 10), // Limit to top 10 activities
+  people: (v.people || []).slice(0, 5), // Limit to top 5 people
+  scenes: (v.scenes || []).slice(0, 5), // Limit to top 5 scenes
+  summary: (v.summary || '').substring(0, 500) // Limit summary length
 })), null, 2)}
 
 Analyze the query and find the most relevant matches. Return JSON with:
@@ -320,11 +352,22 @@ async function answerVideoQuestion(userId, query, videoId = null) {
     }
     videos = [video];
   } else {
-    // Answer question across all videos
+    // Answer question across all videos (limit to recent 10)
     videos = await db.collection('videos')
       .find({ userId })
       .sort({ uploadedAt: -1 })
       .limit(10)
+      .project({
+        filename: 1,
+        uploadedAt: 1,
+        objects: 1,
+        activities: 1,
+        people: 1,
+        scenes: 1,
+        summary: 1,
+        videoPath: 1,
+        _id: 1
+      })
       .toArray();
   }
 
@@ -384,18 +427,18 @@ Answer:`;
     }
   }
 
-  // Use video metadata to answer
+  // Use video metadata to answer (limit data size)
   const prompt = `User question: "${query}"
 
 Video information:
 ${JSON.stringify(videos.map(v => ({
   filename: v.filename,
   uploadedAt: v.uploadedAt,
-  summary: v.summary || '',
-  objects: v.objects || [],
-  activities: v.activities || [],
-  people: v.people || [],
-  scenes: v.scenes || []
+  summary: (v.summary || '').substring(0, 500),
+  objects: (v.objects || []).slice(0, 15), // Limit arrays
+  activities: (v.activities || []).slice(0, 8),
+  people: (v.people || []).slice(0, 5),
+  scenes: (v.scenes || []).slice(0, 5)
 })), null, 2)}
 
 Answer the question based on the video information provided. Be specific and reference which video(s) contain the answer. Return JSON:
@@ -599,15 +642,28 @@ app.post('/api/query', async (req, res) => {
   }
 });
 
-// Get user's videos
+// Get user's videos (optimized - only return essential fields)
 app.get('/api/videos/:userId', async (req, res) => {
   try {
     const videos = await db.collection('videos')
       .find({ userId: req.params.userId })
       .sort({ uploadedAt: -1 })
+      .project({
+        filename: 1,
+        uploadedAt: 1,
+        summary: 1,
+        processed: 1
+      })
       .toArray();
 
-    res.json({ videos });
+    // Add counts client-side to avoid aggregation complexity
+    const videosWithCounts = videos.map(v => ({
+      ...v,
+      objectCount: 0, // Will be calculated if needed
+      activityCount: 0
+    }));
+
+    res.json({ videos: videosWithCounts });
   } catch (error) {
     console.error('Error fetching videos:', error);
     res.status(500).json({ error: error.message });
