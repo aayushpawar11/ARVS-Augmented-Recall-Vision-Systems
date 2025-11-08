@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { VideoUpload } from "@/components/VideoUpload";
 import { VoiceQuery } from "@/components/VoiceQuery";
+import { LiveOverlay } from "@/components/LiveOverlay";
 import { MemoryResults } from "@/components/MemoryResults";
 import { Card } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -87,11 +88,16 @@ const Dashboard = () => {
           </div>
 
           {/* Main Content */}
-          <Tabs defaultValue="upload" className="space-y-6">
-            <TabsList className="grid w-full grid-cols-2">
+          <Tabs defaultValue="live" className="space-y-6">
+            <TabsList className="grid w-full grid-cols-3">
+              <TabsTrigger value="live">Live Vision</TabsTrigger>
               <TabsTrigger value="upload">Upload Video</TabsTrigger>
               <TabsTrigger value="search">Search Memories</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="live" className="space-y-6">
+              <LiveOverlay userId={userId} />
+            </TabsContent>
 
             <TabsContent value="upload" className="space-y-6">
               <VideoUpload userId={userId} />

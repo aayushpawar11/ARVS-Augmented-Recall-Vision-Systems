@@ -11,6 +11,8 @@ import { createAssociatedTokenAccountInstruction, getAssociatedTokenAddress, cre
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
+import { WebSocketServer } from 'ws';
+import { createServer } from 'http';
 
 config();
 
@@ -19,6 +21,9 @@ const __dirname = dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Create HTTP server for WebSocket support
+const server = createServer(app);
 
 // Middleware
 app.use(cors());
@@ -682,10 +687,154 @@ app.post('/api/mint-nft', async (req, res) => {
   }
 });
 
+// Process live vision frame with Gemini
+async function processLiveVisionFrame(base64Image, userQuery, userId) {
+  if (!genAI) {
+    throw new Error('Gemini AI not initialized');
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    
+    // Remove data URL prefix if present
+    const base64Data = base64Image.includes(',') 
+      ? base64Image.split(',')[1] 
+      : base64Image;
+
+    // Build prompt based on whether user has a query
+    let prompt;
+    if (userQuery) {
+      prompt = `You are an AR assistant helping the user through smart glasses. The user asked: "${userQuery}"
+
+Look at this image frame from the user's camera and answer their question naturally and concisely (1-2 sentences max). Be conversational and helpful, as if you're speaking directly to them through their glasses.
+
+Answer:`;
+    } else {
+      prompt = `You are an AR assistant helping the user through smart glasses. Describe what you see in this frame in one concise sentence (max 15 words) as if you are observing and speaking to the user. Be natural and conversational.
+
+Example: "I see a laptop and a water bottle on your desk" or "You're looking at a bookshelf with several books"
+
+Description:`;
+    }
+
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: base64Data
+        }
+      }
+    ]);
+
+    const response = await result.response;
+    const text = response.text().trim();
+
+    // Log to analytics
+    await sendToSnowflake({
+      event: 'live_vision_frame',
+      userId,
+      hasQuery: !!userQuery,
+      timestamp: new Date()
+    });
+
+    return text;
+  } catch (error) {
+    console.error('Error processing live vision frame:', error);
+    throw error;
+  }
+}
+
+// WebSocket server for live vision
+// Use noServer: true and handle upgrade manually to work with Express
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on('connection', (ws, req) => {
+  console.log('✅ New WebSocket connection for live vision');
+  console.log('📡 Client IP:', req.socket.remoteAddress);
+  console.log('📡 Request URL:', req.url);
+
+  ws.on('message', async (message) => {
+    try {
+      console.log('📨 Received WebSocket message, length:', message.length);
+      const data = JSON.parse(message.toString());
+      console.log('📨 Message type:', data.type);
+      
+      if (data.type === 'frame') {
+        const { frame, query, userId } = data;
+        console.log('🖼️ Processing frame, has query:', !!query, 'userId:', userId);
+        
+        // Process frame asynchronously
+        processLiveVisionFrame(frame, query, userId || 'anonymous')
+          .then((caption) => {
+            console.log('✅ Frame processed, caption length:', caption.length);
+            ws.send(JSON.stringify({
+              type: 'caption',
+              text: caption
+            }));
+          })
+          .catch((error) => {
+            console.error('❌ Error processing frame:', error);
+            console.error('❌ Error stack:', error.stack);
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: error.message || 'Failed to process frame'
+            }));
+          });
+      } else {
+        console.log('⚠️ Unknown message type:', data.type);
+      }
+    } catch (error) {
+      console.error('❌ WebSocket message parsing error:', error);
+      console.error('❌ Message content:', message.toString().substring(0, 100));
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Invalid message format: ' + error.message
+      }));
+    }
+  });
+
+  ws.on('close', (code, reason) => {
+    console.log('🔌 WebSocket connection closed');
+    console.log('📊 Close code:', code);
+    console.log('📊 Close reason:', reason.toString());
+  });
+
+  ws.on('error', (error) => {
+    console.error('❌ WebSocket error:', error);
+    console.error('❌ Error stack:', error.stack);
+  });
+
+  // Send a welcome message
+  ws.send(JSON.stringify({
+    type: 'connected',
+    message: 'WebSocket connected successfully'
+  }));
+});
+
+// Handle WebSocket upgrade requests
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+  
+  console.log(`🔌 WebSocket upgrade request for path: ${pathname}`);
+  console.log(`📡 Request headers:`, request.headers);
+  
+  if (pathname === '/api/live-vision') {
+    console.log('✅ Upgrading connection to WebSocket');
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    console.log(`❌ Rejecting WebSocket upgrade for path: ${pathname}`);
+    socket.destroy();
+  }
+});
+
 // Start server
 initServices().then(() => {
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`🚀 MemoryGlass API server running on port ${PORT}`);
+    console.log(`📡 WebSocket server available at ws://localhost:${PORT}/api/live-vision`);
   });
 });
 
