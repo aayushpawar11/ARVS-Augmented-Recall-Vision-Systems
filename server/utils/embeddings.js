@@ -87,3 +87,4 @@ export function getEmbeddingDimensions() {
   return 512;
 }
 
+

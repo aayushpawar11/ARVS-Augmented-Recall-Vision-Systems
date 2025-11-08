@@ -120,3 +120,4 @@ npm list @xenova/transformers fluent-ffmpeg ffmpeg-static
 
 **Need help?** Check `VECTOR_SETUP_INSTRUCTIONS.md` for detailed troubleshooting.
 
+

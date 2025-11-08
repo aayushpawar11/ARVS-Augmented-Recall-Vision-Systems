@@ -38,3 +38,4 @@ console.log('7. Click "Next" and "Create Search Index"');
 console.log('\nNote: The index name must be "vector_index" for the code to work.');
 console.log('='.repeat(60));
 
+

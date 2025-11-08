@@ -113,3 +113,4 @@ The vectorization happens automatically - no configuration needed. However, you 
 
 Live sessions are now automatically vectorized and searchable!
 
+
