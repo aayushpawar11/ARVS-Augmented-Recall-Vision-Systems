@@ -425,6 +425,10 @@ async function processVideoWithGemini(videoPath, userId) {
     try {
       await db.collection('videos').createIndex({ userId: 1, uploadedAt: -1 });
       await db.collection('videos').createIndex({ 'objects.object': 'text', summary: 'text' });
+      await db.collection('videos').createIndex({ userId: 1, filename: 1 }); // For duplicate detection
+      // Query cache indexes
+      await db.collection('query_cache').createIndex({ cacheKey: 1, expiresAt: 1 });
+      await db.collection('query_cache').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // TTL index
     } catch (indexError) {
       // Indexes may already exist, that's fine
       if (!indexError.message.includes('already exists')) {
@@ -499,10 +503,148 @@ function detectQueryType(query) {
   return 'general';
 }
 
+// Query cache - store query results to avoid duplicate API calls
+async function getCachedQueryResult(userId, query) {
+  if (!db) return null;
+  
+  const queryHash = query.toLowerCase().trim().replace(/\s+/g, ' ');
+  const cacheKey = `${userId}:${queryHash}`;
+  
+  // Check cache (30 minute TTL)
+  const cached = await db.collection('query_cache').findOne({
+    cacheKey,
+    expiresAt: { $gt: new Date() }
+  });
+  
+  if (cached) {
+    console.log('💾 Using cached query result');
+    return cached.result;
+  }
+  
+  return null;
+}
+
+async function setCachedQueryResult(userId, query, result) {
+  if (!db) return;
+  
+  const queryHash = query.toLowerCase().trim().replace(/\s+/g, ' ');
+  const cacheKey = `${userId}:${queryHash}`;
+  
+  // Store in cache with 30 minute TTL
+  await db.collection('query_cache').updateOne(
+    { cacheKey },
+    {
+      $set: {
+        cacheKey,
+        userId,
+        query,
+        result,
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000) // 30 minutes
+      }
+    },
+    { upsert: true }
+  );
+}
+
+// Simple keyword matching - try MongoDB search before calling Gemini
+async function trySimpleKeywordMatch(userId, query) {
+  if (!db) return null;
+  
+  const lowerQuery = query.toLowerCase();
+  
+  // Extract object name from simple queries like "where is X" or "where did I leave X"
+  const whereMatch = lowerQuery.match(/where\s+(?:is|did\s+i\s+leave|did\s+i\s+put)\s+(?:my\s+)?(.+?)(?:\?|$)/);
+  const whatMatch = lowerQuery.match(/what\s+(?:is|was)\s+(?:the\s+)?(.+?)(?:\?|$)/);
+  
+  const objectName = whereMatch?.[1] || whatMatch?.[1];
+  
+  if (!objectName || objectName.length < 3) {
+    return null; // Too short or no match, use Gemini
+  }
+  
+  // Try to find object in MongoDB using text search
+  const searchTerm = objectName.trim();
+  
+  const videos = await db.collection('videos')
+    .find({
+      userId,
+      processed: true,
+      $or: [
+        { 'objects.object': { $regex: searchTerm, $options: 'i' } },
+        { summary: { $regex: searchTerm, $options: 'i' } }
+      ]
+    })
+    .sort({ uploadedAt: -1 })
+    .limit(10)
+    .project({
+      filename: 1,
+      uploadedAt: 1,
+      objects: 1,
+      summary: 1,
+      _id: 1
+    })
+    .toArray();
+  
+  if (videos.length === 0) {
+    return null; // No matches, use Gemini
+  }
+  
+  // Found matches - construct simple response without Gemini
+  const matches = [];
+  for (const video of videos) {
+    const matchingObjects = (video.objects || []).filter(obj => 
+      obj.object?.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+    
+    if (matchingObjects.length > 0) {
+      const bestMatch = matchingObjects[0];
+      matches.push({
+        videoId: video._id.toString(),
+        filename: video.filename,
+        timestamp: bestMatch.timestamp || 'unknown',
+        location: bestMatch.location || 'unknown location',
+        confidence: bestMatch.confidence || 0.8,
+        uploadedAt: video.uploadedAt,
+        relevantInfo: `Found ${bestMatch.object} at ${bestMatch.location}`
+      });
+    }
+  }
+  
+  if (matches.length === 0) {
+    return null;
+  }
+  
+  console.log('🔍 Using simple keyword match (skipped Gemini API call)');
+  
+  return {
+    queryType: 'location',
+    object: searchTerm,
+    answer: `I found ${matches.length} match(es) for "${searchTerm}". ${matches[0].location ? `It was last seen ${matches[0].location}` : 'Found in your videos'}.`,
+    matches: matches,
+    bestMatch: matches[0],
+    fromCache: false,
+    fromKeywordMatch: true
+  };
+}
+
 // Query objects using Gemini for natural language understanding
 async function queryObjects(userId, query) {
   if (!genAI) {
     throw new Error('Gemini AI not initialized');
+  }
+
+  // OPTIMIZATION 1: Check cache first
+  const cached = await getCachedQueryResult(userId, query);
+  if (cached) {
+    return cached;
+  }
+  
+  // OPTIMIZATION 2: Try simple keyword matching before Gemini
+  const keywordMatch = await trySimpleKeywordMatch(userId, query);
+  if (keywordMatch) {
+    // Cache the keyword match result
+    await setCachedQueryResult(userId, query, keywordMatch);
+    return keywordMatch;
   }
 
   // Get all user's video data (limit to recent 50 to reduce payload size)
@@ -604,6 +746,9 @@ Analyze the query and find the most relevant matches. Return JSON with:
 
   const parsed = JSON.parse(jsonMatch[0]);
   
+  // OPTIMIZATION 3: Cache the Gemini result
+  await setCachedQueryResult(userId, query, parsed);
+  
   // Log query to Snowflake
   await sendToSnowflake({
     event: 'video_query',
@@ -621,6 +766,12 @@ Analyze the query and find the most relevant matches. Return JSON with:
 async function answerVideoQuestion(userId, query, videoId = null) {
   if (!genAI) {
     throw new Error('Gemini AI not initialized');
+  }
+
+  // OPTIMIZATION: Check cache first
+  const cached = await getCachedQueryResult(userId, query);
+  if (cached && cached.queryType === 'general') {
+    return cached;
   }
 
   let videos;
@@ -822,32 +973,39 @@ Answer the question based on the video information provided. Be specific and ref
   "bestMatch": { ... most relevant match ... }
 }`;
 
-  const result = await generateContentWithRetry(model, prompt);
-  const response = await result.response;
+  const apiResult = await generateContentWithRetry(model, prompt);
+  const response = await apiResult.response;
   const text = response.text();
   
   // Parse JSON response
   const jsonMatch = text.match(/\{[\s\S]*\}/);
+  let result;
+  
   if (jsonMatch) {
     const parsed = JSON.parse(jsonMatch[0]);
-    return {
+    result = {
       answer: parsed.answer || text,
       queryType: 'general',
       matches: parsed.matches || [],
       bestMatch: parsed.bestMatch
     };
+  } else {
+    // Fallback: return text as answer
+    result = {
+      answer: text,
+      queryType: 'general',
+      matches: videosToUse.map(v => ({
+        videoId: v._id.toString(),
+        filename: v.filename,
+        uploadedAt: v.uploadedAt
+      }))
+    };
   }
-
-  // Fallback: return text as answer
-  return {
-    answer: text,
-    queryType: 'general',
-    matches: videosToUse.map(v => ({
-      videoId: v._id.toString(),
-      filename: v.filename,
-      uploadedAt: v.uploadedAt
-    }))
-  };
+  
+  // OPTIMIZATION: Cache the result
+  await setCachedQueryResult(userId, query, result);
+  
+  return result;
 }
 
 // Generate voice response with ElevenLabs
@@ -947,6 +1105,27 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
 
     const userId = req.body.userId || 'anonymous';
     const videoPath = req.file.path;
+    
+    // OPTIMIZATION: Check if video with same filename was already processed
+    const filename = path.basename(videoPath);
+    const existingVideo = await db.collection('videos').findOne({
+      userId,
+      filename: filename,
+      processed: true
+    });
+    
+    if (existingVideo) {
+      console.log('⏭️  Skipping duplicate video processing');
+      // Clean up duplicate file
+      await fs.unlink(videoPath).catch(() => {});
+      return res.json({
+        success: true,
+        videoId: existingVideo._id.toString(),
+        filename: filename,
+        message: 'Video already processed (using cached result)',
+        cached: true
+      });
+    }
 
     // Create initial video document to get MongoDB ID
     const initialVideoDoc = {
@@ -1230,9 +1409,10 @@ async function analyzeVideoChunkForMemory(videoPath, session) {
   if (!genAI) return;
 
   // Skip analysis if we've analyzed too recently (throttle to save API costs)
+  // INCREASED from 6 seconds to 20 seconds to reduce API calls
   const lastAnalysis = session.lastChunkAnalysis || 0;
   const timeSinceLastAnalysis = Date.now() - lastAnalysis;
-  const minInterval = 6000; // Analyze at most every 6 seconds
+  const minInterval = 20000; // Analyze at most every 20 seconds (was 6 seconds)
 
   if (timeSinceLastAnalysis < minInterval && session.chunks.length > 0) {
     // Just store chunk metadata without analysis
