@@ -146,6 +146,94 @@ function initGemini() {
   console.log('✅ Gemini AI initialized');
 }
 
+// Rate limiting and retry logic for Gemini API
+const geminiRequestQueue = [];
+let isProcessingQueue = false;
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 1000; // Minimum 1 second between requests
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY = 2000; // 2 seconds
+
+// Helper: Sleep function
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper: Generate content with rate limiting and retry logic
+async function generateContentWithRetry(model, prompt, options = {}) {
+  const { maxRetries = MAX_RETRIES, retryDelay = INITIAL_RETRY_DELAY } = options;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      // Rate limiting: ensure minimum interval between requests
+      const timeSinceLastRequest = Date.now() - lastRequestTime;
+      if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+        await sleep(MIN_REQUEST_INTERVAL - timeSinceLastRequest);
+      }
+      
+      lastRequestTime = Date.now();
+      
+      // Make the API call
+      const result = await model.generateContent(prompt);
+      return result;
+    } catch (error) {
+      const isRateLimitError = error.status === 429 || 
+                               error.message?.includes('429') ||
+                               error.message?.includes('Too Many Requests') ||
+                               error.message?.includes('Resource exhausted');
+      
+      if (isRateLimitError && attempt < maxRetries) {
+        // Exponential backoff: 2s, 4s, 8s
+        const delay = retryDelay * Math.pow(2, attempt);
+        console.warn(`⚠️  Rate limit hit (429). Retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries + 1})`);
+        await sleep(delay);
+        continue;
+      }
+      
+      // If it's a rate limit error and we've exhausted retries, throw a user-friendly error
+      if (isRateLimitError) {
+        throw new Error('API rate limit exceeded. Please wait a moment and try again. The system will automatically retry your request.');
+      }
+      
+      // For other errors, throw immediately
+      throw error;
+    }
+  }
+}
+
+// Process request queue
+async function processRequestQueue() {
+  if (isProcessingQueue || geminiRequestQueue.length === 0) {
+    return;
+  }
+  
+  isProcessingQueue = true;
+  
+  while (geminiRequestQueue.length > 0) {
+    const { model, prompt, resolve, reject, options } = geminiRequestQueue.shift();
+    
+    try {
+      const result = await generateContentWithRetry(model, prompt, options);
+      resolve(result);
+    } catch (error) {
+      reject(error);
+    }
+    
+    // Small delay between queue items
+    if (geminiRequestQueue.length > 0) {
+      await sleep(MIN_REQUEST_INTERVAL);
+    }
+  }
+  
+  isProcessingQueue = false;
+}
+
+// Queue a request (for future use if needed)
+async function queueGeminiRequest(model, prompt, options = {}) {
+  return new Promise((resolve, reject) => {
+    geminiRequestQueue.push({ model, prompt, resolve, reject, options });
+    processRequestQueue();
+  });
+}
+
 // Solana connection
 function initSolana() {
   try {
@@ -196,7 +284,7 @@ async function extractQuestionsFromVideo(videoPath) {
       ]
     }`;
 
-    const result = await model.generateContent([
+    const result = await generateContentWithRetry(model, [
       prompt,
       {
         inlineData: {
@@ -251,7 +339,7 @@ Analyze the video and provide a clear, detailed answer to this question. Conside
 
 Provide a comprehensive answer:`;
 
-        const result = await model.generateContent([
+        const result = await generateContentWithRetry(model, [
           prompt,
           {
             inlineData: {
@@ -331,7 +419,7 @@ async function processVideoWithGemini(videoPath, userId) {
       "summary": "Video shows a person working at a desk with various objects including a water bottle, laptop, and papers. The person is typing and occasionally drinks water."
     }`;
 
-    const result = await model.generateContent([
+    const result = await generateContentWithRetry(model, [
       prompt,
       {
         inlineData: {
@@ -536,7 +624,7 @@ Analyze the query and find the most relevant matches. Return JSON with:
   "bestMatch": { ... most recent/relevant match ... }
 }`;
 
-  const result = await model.generateContent(searchPrompt);
+  const result = await generateContentWithRetry(model, searchPrompt);
   const response = await result.response;
   const text = response.text();
   
@@ -624,7 +712,7 @@ Analyze this video and answer the question in detail. Provide:
 
 Answer:`;
 
-      const result = await model.generateContent([
+      const result = await generateContentWithRetry(model, [
         prompt,
         {
           inlineData: {
@@ -684,7 +772,7 @@ Answer the question based on the video information provided. Be specific and ref
   "bestMatch": { ... most relevant match ... }
 }`;
 
-  const result = await model.generateContent(prompt);
+  const result = await generateContentWithRetry(model, prompt);
   const response = await result.response;
   const text = response.text();
   
@@ -970,7 +1058,24 @@ app.post('/api/query', async (req, res) => {
     });
   } catch (error) {
     console.error('Query error:', error);
-    res.status(500).json({ error: error.message });
+    
+    // Check if it's a rate limit error
+    const isRateLimitError = error.status === 429 || 
+                             error.message?.includes('429') ||
+                             error.message?.includes('Too Many Requests') ||
+                             error.message?.includes('Resource exhausted') ||
+                             error.message?.includes('rate limit');
+    
+    if (isRateLimitError) {
+      return res.status(429).json({ 
+        error: 'API rate limit exceeded. The system is automatically retrying your request. Please wait a moment and try again.',
+        retryAfter: 60 // Suggest waiting 60 seconds
+      });
+    }
+    
+    res.status(500).json({ 
+      error: error.message || 'An error occurred while processing your query. Please try again.' 
+    });
   }
 });
 
@@ -1111,7 +1216,7 @@ Return JSON:
   "activity": "Person working at desk"
 }`;
 
-    const result = await model.generateContent([
+    const result = await generateContentWithRetry(model, [
       prompt,
       {
         inlineData: {
@@ -1286,10 +1391,49 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
       });
     }
 
+    // Check if Gemini is initialized
+    if (!genAI) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return res.status(500).json({ 
+        error: 'Gemini AI not initialized. Please check your GEMINI_API_KEY in .env file.' 
+      });
+    }
+
     const videoPath = req.file.path;
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    
+    // Validate video file
     const videoData = await fs.readFile(videoPath);
+    const videoSize = videoData.length;
+    
+    // Check if video is too small (likely corrupted or empty)
+    if (videoSize < 1000) { // Less than 1KB is suspicious
+      await fs.unlink(videoPath).catch(() => {});
+      return res.status(400).json({ 
+        error: 'Video chunk is too small or empty. Please try again.' 
+      });
+    }
+    
+    // Check if video is too large (Gemini has limits - typically 20MB for base64)
+    // Base64 encoding increases size by ~33%, so 15MB raw = ~20MB base64
+    const MAX_VIDEO_SIZE = 15 * 1024 * 1024; // 15MB
+    if (videoSize > MAX_VIDEO_SIZE) {
+      await fs.unlink(videoPath).catch(() => {});
+      return res.status(400).json({ 
+        error: 'Video chunk is too large. Please use shorter video segments.' 
+      });
+    }
+    
+    // Detect actual mimeType from file
+    const detectedMimeType = req.file.mimetype || 'video/webm';
+    // Ensure we use a valid mimeType for Gemini
+    const validMimeTypes = ['video/webm', 'video/mp4', 'video/quicktime', 'video/x-msvideo'];
+    const mimeType = validMimeTypes.includes(detectedMimeType) ? detectedMimeType : 'video/webm';
+    
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
     const base64Video = videoData.toString('base64');
+    
+    // Log video info for debugging
+    console.log(`📹 Processing video chunk: ${(videoSize / 1024).toFixed(2)}KB, mimeType: ${mimeType}`);
 
     // Check if question is about past/memory (e.g., "did I leave", "a few minutes ago", "earlier")
     const lowerQuestion = question.toLowerCase();
@@ -1353,11 +1497,11 @@ Focus on what is visible RIGHT NOW in the video.
 Answer (2-3 sentences, be concise):`;
     }
 
-    const result = await model.generateContent([
+    const result = await generateContentWithRetry(model, [
       prompt,
       {
         inlineData: {
-          mimeType: 'video/webm',
+          mimeType: mimeType,
           data: base64Video
         }
       }
@@ -1402,12 +1546,44 @@ Answer (2-3 sentences, be concise):`;
     });
   } catch (error) {
     console.error('Live answer error:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      code: error.code,
+      status: error.status,
+      statusText: error.statusText
+    });
     
+    // Clean up file if it exists
     if (req.file?.path) {
       await fs.unlink(req.file.path).catch(() => {});
     }
     
-    res.status(500).json({ error: error.message });
+    // Check for specific error types
+    const isBadRequest = error.status === 400 || 
+                        error.message?.includes('400') ||
+                        error.message?.includes('Bad Request') ||
+                        error.message?.includes('invalid argument');
+    
+    if (isBadRequest) {
+      return res.status(400).json({ 
+        error: 'Invalid video format or data. The video chunk may be corrupted or in an unsupported format. Please try again.',
+        details: 'Video must be a valid WebM or MP4 file and not empty.'
+      });
+    }
+    
+    // Provide more detailed error message
+    let errorMessage = 'Unable to generate answer at this time.';
+    if (error.message?.includes('API_KEY')) {
+      errorMessage = 'Invalid Gemini API key. Please check your GEMINI_API_KEY in .env file.';
+    } else if (error.message?.includes('quota') || error.message?.includes('limit')) {
+      errorMessage = 'API quota exceeded. Please check your Gemini API usage limits.';
+    } else if (error.message) {
+      errorMessage = `Error: ${error.message}`;
+    }
+    
+    res.status(500).json({ error: errorMessage });
   }
 });
 

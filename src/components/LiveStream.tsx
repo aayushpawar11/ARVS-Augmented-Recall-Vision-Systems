@@ -127,13 +127,24 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
         return;
       }
 
-      // Create a blob from recent chunks (last 10 seconds worth)
-      const recentChunks = videoChunksRef.current.slice(-3); // Last 3 chunks (~6-9 seconds)
-      const videoBlob = new Blob(recentChunks, { type: 'video/webm' });
+      // Use the most recent complete chunk instead of combining multiple chunks
+      // Combining WebM chunks doesn't create a valid WebM file
+      const latestChunk = videoChunksRef.current[videoChunksRef.current.length - 1];
       
-      // Create FormData
+      // Validate chunk size (must be at least 1KB to be valid)
+      if (!latestChunk || latestChunk.size < 1024) {
+        toast({
+          title: "Video chunk too small",
+          description: "Please wait a moment for more video data to be recorded",
+          variant: "destructive",
+        });
+        setIsProcessing(false);
+        return;
+      }
+      
+      // Create FormData with the single complete chunk
       const formData = new FormData();
-      formData.append('video', videoBlob, 'live-chunk.webm');
+      formData.append('video', latestChunk, 'live-chunk.webm');
       formData.append('question', question.question);
       formData.append('userId', userId);
       formData.append('timestamp', question.timestamp.toString());
@@ -157,6 +168,24 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
             ? { ...q, answer: 'Rate limited - please wait a moment.', answered: true }
             : q
         ));
+        setIsProcessing(false);
+        return;
+      }
+
+      if (response.status === 400) {
+        // Bad request - video format issue
+        const errorMessage = data.error || 'Video format issue. Please try again.';
+        toast({
+          title: "Video format error",
+          description: errorMessage,
+          variant: "destructive",
+        });
+        setQuestions(prev => prev.map(q => 
+          q.timestamp === question.timestamp 
+            ? { ...q, answer: errorMessage, answered: true }
+            : q
+        ));
+        setIsProcessing(false);
         return;
       }
 
@@ -209,11 +238,21 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
       }
     } catch (error) {
       console.error('Error answering question:', error);
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Unable to generate answer at this time.';
+      
       setQuestions(prev => prev.map(q => 
         q.timestamp === question.timestamp 
-          ? { ...q, answer: 'Unable to generate answer at this time.', answered: true }
+          ? { ...q, answer: errorMessage, answered: true }
           : q
       ));
+      
+      toast({
+        title: "Error",
+        description: errorMessage,
+        variant: "destructive",
+      });
     } finally {
       setIsProcessing(false);
     }
@@ -251,15 +290,105 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
 
   const startStream = async () => {
     try {
-      // Get user media
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720, facingMode: 'user' },
-        audio: true
-      });
+      // Check if getUserMedia is available
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        toast({
+          title: "Camera/Microphone not supported",
+          description: "Your browser doesn't support camera/microphone access. Please use Chrome, Firefox, or Safari.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      // Check if we're on HTTPS or localhost (required for getUserMedia)
+      const isSecure = window.location.protocol === 'https:' || 
+                       window.location.hostname === 'localhost' || 
+                       window.location.hostname === '127.0.0.1';
+      
+      if (!isSecure) {
+        toast({
+          title: "Secure connection required",
+          description: "Camera/microphone access requires HTTPS. Please access this site via https:// or localhost.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      // Get user media with better error handling
+      let stream: MediaStream | null = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { 
+            width: { ideal: 1280 }, 
+            height: { ideal: 720 }, 
+            facingMode: 'user' 
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+      } catch (mediaError: any) {
+        console.error('getUserMedia error:', mediaError);
+        
+        let errorMessage = "Please allow camera and microphone access";
+        let errorTitle = "Permission denied";
+        
+        if (mediaError.name === 'NotAllowedError' || mediaError.name === 'PermissionDeniedError') {
+          errorTitle = "Camera/Microphone access denied";
+          errorMessage = "Please click the camera/microphone icon in your browser's address bar and allow access, then try again.";
+        } else if (mediaError.name === 'NotFoundError' || mediaError.name === 'DevicesNotFoundError') {
+          errorTitle = "No camera/microphone found";
+          errorMessage = "Please connect a camera and microphone to your device.";
+        } else if (mediaError.name === 'NotReadableError' || mediaError.name === 'TrackStartError') {
+          errorTitle = "Camera/Microphone in use";
+          errorMessage = "Another application is using your camera/microphone. Please close it and try again.";
+        } else if (mediaError.name === 'OverconstrainedError') {
+          errorTitle = "Camera settings not supported";
+          errorMessage = "Your camera doesn't support the requested settings. Trying with default settings...";
+          // Try again with default settings
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: true
+            });
+          } catch (retryError) {
+            toast({
+              title: errorTitle,
+              description: "Unable to access camera/microphone. Please check your device settings.",
+              variant: "destructive",
+            });
+            return;
+          }
+        } else {
+          errorMessage = `Unable to access camera/microphone: ${mediaError.message || mediaError.name}`;
+        }
+        
+        if (!stream) {
+          toast({
+            title: errorTitle,
+            description: errorMessage,
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
+      if (!stream) {
+        toast({
+          title: "Failed to start stream",
+          description: "Unable to access camera/microphone.",
+          variant: "destructive",
+        });
+        return;
+      }
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        videoRef.current.play().catch(err => {
+          console.error('Error playing video:', err);
+        });
       }
 
       streamRef.current = stream;
@@ -275,12 +404,20 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
         sessionStartedRef.current = true;
       } catch (error) {
         console.error('Error starting session:', error);
+        // Continue anyway - server session is optional
       }
 
       // Start MediaRecorder for video chunks
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'video/webm;codecs=vp8,opus'
-      });
+      let mediaRecorder: MediaRecorder;
+      try {
+        mediaRecorder = new MediaRecorder(stream, {
+          mimeType: 'video/webm;codecs=vp8,opus'
+        });
+      } catch (recorderError) {
+        // Fallback to default mimeType if codec not supported
+        console.warn('Preferred codec not supported, using default:', recorderError);
+        mediaRecorder = new MediaRecorder(stream);
+      }
 
       mediaRecorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
@@ -311,8 +448,13 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
 
       // Start speech recognition
       if (recognitionRef.current) {
-        recognitionRef.current.start();
-        setIsRecording(true);
+        try {
+          recognitionRef.current.start();
+          setIsRecording(true);
+        } catch (speechError) {
+          console.warn('Speech recognition error:', speechError);
+          // Continue without speech recognition
+        }
       }
 
       toast({
@@ -323,7 +465,7 @@ export const LiveStream = ({ userId = "user-1" }: LiveStreamProps) => {
       console.error('Error starting stream:', error);
       toast({
         title: "Failed to start stream",
-        description: "Please allow camera and microphone access",
+        description: error instanceof Error ? error.message : "Please allow camera and microphone access and try again.",
         variant: "destructive",
       });
     }
