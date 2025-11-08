@@ -1049,6 +1049,63 @@ function getLiveStreamSession(userId) {
   return session;
 }
 
+// Retrieve historical session memories from MongoDB
+async function getHistoricalSessionMemories(userId, limit = 10) {
+  try {
+    if (!db) {
+      console.warn('MongoDB not connected, cannot retrieve historical memories');
+      return { objects: [], activities: [] };
+    }
+
+    const historicalSessions = await db.collection('live_sessions')
+      .find({ userId: userId || 'anonymous' })
+      .sort({ endedAt: -1 }) // Most recent first
+      .limit(limit)
+      .project({
+        objects: 1,
+        activities: 1,
+        startedAt: 1,
+        endedAt: 1,
+        duration: 1
+      })
+      .toArray();
+
+    // Combine all objects and activities from historical sessions
+    const allHistoricalObjects = [];
+    const allHistoricalActivities = [];
+
+    historicalSessions.forEach(session => {
+      if (session.objects && Array.isArray(session.objects)) {
+        session.objects.forEach(obj => {
+          allHistoricalObjects.push({
+            ...obj,
+            sessionDate: session.startedAt,
+            sessionEnded: session.endedAt
+          });
+        });
+      }
+      if (session.activities && Array.isArray(session.activities)) {
+        session.activities.forEach(act => {
+          allHistoricalActivities.push({
+            ...act,
+            sessionDate: session.startedAt,
+            sessionEnded: session.endedAt
+          });
+        });
+      }
+    });
+
+    return {
+      objects: allHistoricalObjects,
+      activities: allHistoricalActivities,
+      sessionCount: historicalSessions.length
+    };
+  } catch (error) {
+    console.error('Error retrieving historical session memories:', error);
+    return { objects: [], activities: [], sessionCount: 0 };
+  }
+}
+
 // Analyze video chunk and extract objects/activities (lightweight analysis)
 // Only analyzes every Nth chunk to save API costs (configurable)
 const CHUNK_ANALYSIS_INTERVAL = 2; // Analyze every 2nd chunk (~6 seconds of video)
@@ -1316,9 +1373,9 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
     // Log video info for debugging
     console.log(`📹 Processing video chunk: ${(videoSize / 1024).toFixed(2)}KB, mimeType: ${mimeType}`);
     
-    // Check if question is about past/memory (e.g., "did I leave", "what was", "just showed")
+    // Check if question is about past/memory (e.g., "did I leave", "what was", "just showed", "held up")
     const lowerQuestion = question.toLowerCase();
-    isMemoryQuestion = lowerQuestion.includes('did i') ||
+    isMemoryQuestion = lowerQuestion.includes('did i') || 
                             lowerQuestion.includes('left') || 
                             lowerQuestion.includes('ago') || 
                             lowerQuestion.includes('earlier') ||
@@ -1333,42 +1390,100 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
                             lowerQuestion.includes('i just') ||
                             lowerQuestion.includes('i showed') ||
                             lowerQuestion.includes('remember') ||
-                            lowerQuestion.includes('what did i');
+                            lowerQuestion.includes('what did i') ||
+                            lowerQuestion.includes('held up') ||
+                            lowerQuestion.includes('held') ||
+                            lowerQuestion.includes('i held') ||
+                            lowerQuestion.includes('did i hold') ||
+                            lowerQuestion.includes('what can') ||
+                            lowerQuestion.includes('what did');
 
     let prompt;
     let memoryContext = '';
 
-    if (isMemoryQuestion && session.objects.length > 0) {
-      // Memory-based question - use session history
-      const recentObjects = session.objects
+    // For memory questions, check both current session and historical sessions
+    if (isMemoryQuestion) {
+      // Get current session objects and activities
+      const currentObjects = session.objects
         .slice(-50) // Last 50 objects
         .map(obj => ({
           object: obj.object,
           location: obj.location,
           time: obj.relativeTime,
-          confidence: obj.confidence
+          confidence: obj.confidence,
+          source: 'current_session'
         }));
 
-      const recentActivities = session.activities
+      const currentActivities = session.activities
         .slice(-20) // Last 20 activities
         .map(act => ({
           activity: act.activity,
-          time: act.relativeTime
+          time: act.relativeTime,
+          source: 'current_session'
         }));
 
+      // Get historical session memories from MongoDB
+      const historicalMemories = await getHistoricalSessionMemories(userId || 'anonymous', 10);
+      
+      // Combine current and historical objects/activities
+      const allObjects = [
+        ...currentObjects,
+        ...historicalMemories.objects
+          .slice(-100) // Last 100 from historical sessions
+          .map(obj => ({
+            object: obj.object,
+            location: obj.location || 'unknown',
+            time: obj.relativeTime || (obj.sessionDate ? new Date(obj.sessionDate).toLocaleString() : 'previous session'),
+            confidence: obj.confidence || 0.7,
+            source: 'previous_session',
+            sessionDate: obj.sessionDate
+          }))
+      ];
+
+      const allActivities = [
+        ...currentActivities,
+        ...historicalMemories.activities
+          .slice(-50) // Last 50 from historical sessions
+          .map(act => ({
+            activity: act.activity,
+            time: act.relativeTime || (act.sessionDate ? new Date(act.sessionDate).toLocaleString() : 'previous session'),
+            source: 'previous_session',
+            sessionDate: act.sessionDate
+          }))
+      ];
+
+      // Always proceed with memory questions - even if current session is empty, check historical
+      const currentSessionDuration = Math.floor((Date.now() - session.startedAt) / 60000);
+      
       memoryContext = `
-Session Memory (from last ${Math.floor((Date.now() - session.startedAt) / 60000)} minutes):
-Objects seen: ${JSON.stringify(recentObjects, null, 2)}
-Activities: ${JSON.stringify(recentActivities, null, 2)}
+ALL SESSION MEMORIES (across all sessions):
+
+Current Session (last ${currentSessionDuration} minutes):
+- Objects: ${currentObjects.length}
+- Activities: ${currentActivities.length}
+
+Historical Sessions (from ${historicalMemories.sessionCount} previous session${historicalMemories.sessionCount !== 1 ? 's' : ''}):
+- Objects: ${historicalMemories.objects.length}
+- Activities: ${historicalMemories.activities.length}
+
+ALL OBJECTS SEEN (current + historical):
+${JSON.stringify(allObjects, null, 2)}
+
+ALL ACTIVITIES (current + historical):
+${JSON.stringify(allActivities, null, 2)}
 `;
 
-      // For strong memory questions (past tense, "just", "was"), prioritize memory
+      // For strong memory questions (past tense, "just", "was", "held"), prioritize memory
       const isStrongMemoryQuestion = lowerQuestion.includes('what was') ||
                                      lowerQuestion.includes('just showed') ||
                                      lowerQuestion.includes('just did') ||
                                      lowerQuestion.includes('i just') ||
                                      lowerQuestion.includes('did i leave') ||
-                                     lowerQuestion.includes('was there');
+                                     lowerQuestion.includes('was there') ||
+                                     lowerQuestion.includes('held up') ||
+                                     lowerQuestion.includes('i held') ||
+                                     lowerQuestion.includes('what can') ||
+                                     lowerQuestion.includes('what did');
 
       if (isStrongMemoryQuestion) {
         // Answer from memory only - don't require video
@@ -1377,10 +1492,11 @@ Activities: ${JSON.stringify(recentActivities, null, 2)}
 
 ${memoryContext}
 
-This question is asking about something from the past. Answer it based ONLY on the session memory provided above.
-Search through the objects and activities to find what the user is asking about.
+This question is asking about something from the past (current session or previous sessions). 
+Answer it based on ALL the session memories provided above - search through BOTH current session and historical sessions.
+Look for objects or activities that match what the user is asking about.
 
-Provide a clear, detailed answer based on the memory data:`;
+Provide a clear, detailed answer based on the memory data. If you find it in a previous session, mention that.`;
       } else {
         // Combine memory with current video
         prompt = `Question: "${question}"
@@ -1392,9 +1508,9 @@ Current video context (what's visible NOW):
 
 Answer the question by combining:
 1. Current video context (what's visible right now)
-2. Session memory (what happened in the last few minutes)
+2. All session memories (current + historical sessions)
 
-If the question asks about something from the past (like "did I leave X"), search through the session memory.
+If the question asks about something from the past, search through ALL session memories (current and historical).
 If asking about current state, focus on the current video.
 
 Provide a clear, concise answer (2-3 sentences):`;
@@ -1486,39 +1602,82 @@ Answer (2-3 sentences, be concise):`;
                         error.message?.includes('invalid argument');
     
     // If it's a memory question and video processing failed, try memory-only fallback
-    if (isMemoryQuestion && session.objects.length > 0 && (isBadRequest || !useMemoryOnly)) {
+    // Check both current session and historical sessions
+    if (isMemoryQuestion && (isBadRequest || !useMemoryOnly)) {
       console.log('🔄 Video processing failed for memory question, falling back to memory-only answer...');
       try {
-        const recentObjects = session.objects
+        // Get both current and historical memories for fallback
+        const currentObjects = session.objects
           .slice(-50)
           .map(obj => ({
             object: obj.object,
             location: obj.location,
             time: obj.relativeTime,
-            confidence: obj.confidence
+            confidence: obj.confidence,
+            source: 'current_session'
           }));
 
-        const recentActivities = session.activities
+        const currentActivities = session.activities
           .slice(-20)
           .map(act => ({
             activity: act.activity,
-            time: act.relativeTime
+            time: act.relativeTime,
+            source: 'current_session'
           }));
 
+        const historicalMemories = await getHistoricalSessionMemories(userId || 'anonymous', 10);
+        
+        const allObjects = [
+          ...currentObjects,
+          ...historicalMemories.objects
+            .slice(-100)
+            .map(obj => ({
+              object: obj.object,
+              location: obj.location || 'unknown',
+              time: obj.relativeTime || (obj.sessionDate ? new Date(obj.sessionDate).toLocaleString() : 'previous session'),
+              confidence: obj.confidence || 0.7,
+              source: 'previous_session'
+            }))
+        ];
+
+        const allActivities = [
+          ...currentActivities,
+          ...historicalMemories.activities
+            .slice(-50)
+            .map(act => ({
+              activity: act.activity,
+              time: act.relativeTime || (act.sessionDate ? new Date(act.sessionDate).toLocaleString() : 'previous session'),
+              source: 'previous_session'
+            }))
+        ];
+
+        const currentSessionDuration = Math.floor((Date.now() - session.startedAt) / 60000);
         const memoryContext = `
-Session Memory (from last ${Math.floor((Date.now() - session.startedAt) / 60000)} minutes):
-Objects seen: ${JSON.stringify(recentObjects, null, 2)}
-Activities: ${JSON.stringify(recentActivities, null, 2)}
+ALL SESSION MEMORIES (across all sessions):
+
+Current Session (last ${currentSessionDuration} minutes):
+- Objects: ${currentObjects.length}
+- Activities: ${currentActivities.length}
+
+Historical Sessions (from ${historicalMemories.sessionCount} previous session${historicalMemories.sessionCount !== 1 ? 's' : ''}):
+- Objects: ${historicalMemories.objects.length}
+- Activities: ${historicalMemories.activities.length}
+
+ALL OBJECTS SEEN (current + historical):
+${JSON.stringify(allObjects, null, 2)}
+
+ALL ACTIVITIES (current + historical):
+${JSON.stringify(allActivities, null, 2)}
 `;
 
         const fallbackPrompt = `Question: "${question}"
 
 ${memoryContext}
 
-The video processing failed, but answer this question based on the session memory provided above.
-Search through the objects and activities to find what the user is asking about.
+The video processing failed, but answer this question based on ALL session memories provided above (current + historical sessions).
+Search through the objects and activities from ALL sessions to find what the user is asking about.
 
-Provide a clear, detailed answer based on the memory data:`;
+Provide a clear, detailed answer based on the memory data. If found in a previous session, mention that.`;
 
         if (!model) {
           model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
