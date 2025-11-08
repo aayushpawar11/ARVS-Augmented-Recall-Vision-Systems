@@ -1235,6 +1235,11 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
 
     // Get or create session
     const session = getLiveStreamSession(userId || 'anonymous');
+    
+    // Declare variables for memory question detection (needed in catch block)
+    let isMemoryQuestion = false;
+    let useMemoryOnly = false;
+    let model = null;
 
     // Rate limiting - prevent too many API calls
     const userKey = `${userId}-${Date.now() - (Date.now() % RATE_LIMIT_WINDOW)}`;
@@ -1304,21 +1309,31 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
     const validMimeTypes = ['video/webm', 'video/mp4', 'video/quicktime', 'video/x-msvideo'];
     const mimeType = validMimeTypes.includes(detectedMimeType) ? detectedMimeType : 'video/webm';
     
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    // Initialize model
+    model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
     const base64Video = videoData.toString('base64');
     
     // Log video info for debugging
     console.log(`📹 Processing video chunk: ${(videoSize / 1024).toFixed(2)}KB, mimeType: ${mimeType}`);
-
-    // Check if question is about past/memory (e.g., "did I leave", "a few minutes ago", "earlier")
+    
+    // Check if question is about past/memory (e.g., "did I leave", "what was", "just showed")
     const lowerQuestion = question.toLowerCase();
-    const isMemoryQuestion = lowerQuestion.includes('did i') || 
+    isMemoryQuestion = lowerQuestion.includes('did i') ||
                             lowerQuestion.includes('left') || 
                             lowerQuestion.includes('ago') || 
                             lowerQuestion.includes('earlier') ||
                             lowerQuestion.includes('before') ||
                             lowerQuestion.includes('minutes ago') ||
-                            lowerQuestion.includes('was there');
+                            lowerQuestion.includes('was there') ||
+                            lowerQuestion.includes('what was') ||
+                            lowerQuestion.includes('just showed') ||
+                            lowerQuestion.includes('just did') ||
+                            lowerQuestion.includes('showed you') ||
+                            lowerQuestion.includes('showed me') ||
+                            lowerQuestion.includes('i just') ||
+                            lowerQuestion.includes('i showed') ||
+                            lowerQuestion.includes('remember') ||
+                            lowerQuestion.includes('what did i');
 
     let prompt;
     let memoryContext = '';
@@ -1347,7 +1362,28 @@ Objects seen: ${JSON.stringify(recentObjects, null, 2)}
 Activities: ${JSON.stringify(recentActivities, null, 2)}
 `;
 
-      prompt = `Question: "${question}"
+      // For strong memory questions (past tense, "just", "was"), prioritize memory
+      const isStrongMemoryQuestion = lowerQuestion.includes('what was') ||
+                                     lowerQuestion.includes('just showed') ||
+                                     lowerQuestion.includes('just did') ||
+                                     lowerQuestion.includes('i just') ||
+                                     lowerQuestion.includes('did i leave') ||
+                                     lowerQuestion.includes('was there');
+
+      if (isStrongMemoryQuestion) {
+        // Answer from memory only - don't require video
+        useMemoryOnly = true;
+        prompt = `Question: "${question}"
+
+${memoryContext}
+
+This question is asking about something from the past. Answer it based ONLY on the session memory provided above.
+Search through the objects and activities to find what the user is asking about.
+
+Provide a clear, detailed answer based on the memory data:`;
+      } else {
+        // Combine memory with current video
+        prompt = `Question: "${question}"
 
 ${memoryContext}
 
@@ -1362,6 +1398,7 @@ If the question asks about something from the past (like "did I leave X"), searc
 If asking about current state, focus on the current video.
 
 Provide a clear, concise answer (2-3 sentences):`;
+      }
     } else {
       // Current context question
       prompt = `Question: "${question}"
@@ -1372,15 +1409,22 @@ Focus on what is visible RIGHT NOW in the video.
 Answer (2-3 sentences, be concise):`;
     }
 
-    const result = await generateContentWithRetry(model, [
-      prompt,
-      {
-        inlineData: {
-          mimeType: mimeType,
-          data: base64Video
+    let result;
+    if (useMemoryOnly) {
+      // Answer from memory only - no video needed
+      result = await generateContentWithRetry(model, prompt);
+    } else {
+      // Include video in the request
+      result = await generateContentWithRetry(model, [
+        prompt,
+        {
+          inlineData: {
+            mimeType: mimeType,
+            data: base64Video
+          }
         }
-      }
-    ]);
+      ]);
+    }
 
     const response = await result.response;
     const answer = response.text().trim();
@@ -1441,7 +1485,69 @@ Answer (2-3 sentences, be concise):`;
                         error.message?.includes('Bad Request') ||
                         error.message?.includes('invalid argument');
     
-    if (isBadRequest) {
+    // If it's a memory question and video processing failed, try memory-only fallback
+    if (isMemoryQuestion && session.objects.length > 0 && (isBadRequest || !useMemoryOnly)) {
+      console.log('🔄 Video processing failed for memory question, falling back to memory-only answer...');
+      try {
+        const recentObjects = session.objects
+          .slice(-50)
+          .map(obj => ({
+            object: obj.object,
+            location: obj.location,
+            time: obj.relativeTime,
+            confidence: obj.confidence
+          }));
+
+        const recentActivities = session.activities
+          .slice(-20)
+          .map(act => ({
+            activity: act.activity,
+            time: act.relativeTime
+          }));
+
+        const memoryContext = `
+Session Memory (from last ${Math.floor((Date.now() - session.startedAt) / 60000)} minutes):
+Objects seen: ${JSON.stringify(recentObjects, null, 2)}
+Activities: ${JSON.stringify(recentActivities, null, 2)}
+`;
+
+        const fallbackPrompt = `Question: "${question}"
+
+${memoryContext}
+
+The video processing failed, but answer this question based on the session memory provided above.
+Search through the objects and activities to find what the user is asking about.
+
+Provide a clear, detailed answer based on the memory data:`;
+
+        if (!model) {
+          model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+        }
+        const fallbackResult = await generateContentWithRetry(model, fallbackPrompt);
+        const fallbackResponse = await fallbackResult.response;
+        const fallbackAnswer = fallbackResponse.text().trim();
+
+        const voiceAudio = await generateVoiceResponse(fallbackAnswer);
+
+        return res.json({
+          answer: fallbackAnswer,
+          question,
+          timestamp: timestamp ? parseInt(timestamp) : Date.now(),
+          voiceAudio: voiceAudio ? `data:audio/mpeg;base64,${voiceAudio}` : null,
+          usedMemory: true,
+          memoryContext: {
+            objectsFound: session.objects.length,
+            activitiesFound: session.activities.length
+          },
+          fallback: true
+        });
+      } catch (fallbackError) {
+        console.error('Fallback memory answer also failed:', fallbackError);
+        // Continue to error response below
+      }
+    }
+    
+    if (isBadRequest && !isMemoryQuestion) {
       return res.status(400).json({ 
         error: 'Invalid video format or data. The video chunk may be corrupted or in an unsupported format. Please try again.',
         details: 'Video must be a valid WebM or MP4 file and not empty.'
