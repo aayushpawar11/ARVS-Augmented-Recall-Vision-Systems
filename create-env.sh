@@ -4,7 +4,7 @@
 
 cat > server/.env << 'EOF'
 # Gemini API
-GEMINI_API_KEY=AIzaSyBm_KUwEOD5Nnq9yv0rSAN55hPfg1Croso
+GEMINI_API_KEY=AIzaSyANnYB6DhWB4HR8rpfkkYWo9v2chsJHMd8
 
 # MongoDB Atlas
 MONGODB_URI=mongodb+srv://aayushpawar4455_db_user:M6WAZoNssgsP8x9U@cluster0.4ma2dmi.mongodb.net/memoryglass?retryWrites=true&w=majority
@@ -19,7 +19,7 @@ ELEVENLABS_API_KEY=sk_c4fe8add6ab7278103ad2e42b1023dfa5717c8282ed5b219
 ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
 
 # Snowflake
-SNOWFLAKE_API_URL=https://your-account.snowflakecomputing.com/api/v1/statements
+SNOWFLAKE_API_URL=https://aayushpawar4455_db_user.snowflakecomputing.com/api/v1/statements
 SNOWFLAKE_API_KEY=eyJraWQiOiI5NjA1OTAyMzQxIiwiYWxnIjoiRVMyNTYifQ.eyJwIjoiMzc1MjI5NDg6Mzc1MjI5NDgiLCJpc3MiOiJTRjozMDA0IiwiZXhwIjoxNzYzODczOTMxfQ.d7cVs5vkYgc3wjCYJnpaCgGOCzfTLwYbSk7MA0_2X0WD_d7o0TCz4jQsqegFQIbnZ-QlYlg0avg_TQ5OMPppCg
 
 # Server
