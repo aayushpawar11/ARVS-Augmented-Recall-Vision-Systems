@@ -1,6 +1,11 @@
-// API Configuration
-export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+// Web API Configuration - uses shared API client
+import { createApiClient } from '@shared/api';
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+
+export const apiClient = createApiClient(API_BASE_URL);
+
+// Legacy endpoints export for backward compatibility
 export const API_ENDPOINTS = {
   UPLOAD: `${API_BASE_URL}/api/upload`,
   QUERY: `${API_BASE_URL}/api/query`,

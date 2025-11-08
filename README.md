@@ -14,7 +14,8 @@ Never forget where you left anything. MemoryGlass is an AI-powered spatial memor
 
 ## 🛠️ Tech Stack
 
-- **Frontend**: React + TypeScript + Vite + shadcn-ui
+- **Web Frontend**: React + TypeScript + Vite + shadcn-ui
+- **Mobile App**: Expo + React Native + TypeScript
 - **Backend**: Node.js + Express
 - **AI/ML**: 
   - Gemini 2.0 Flash (Vision AI & Natural Language Understanding)
@@ -24,6 +25,19 @@ Never forget where you left anything. MemoryGlass is an AI-powered spatial memor
 - **Analytics**: Snowflake API (Data Warehousing)
 - **Hosting**: Vultr (Cloud Infrastructure)
 - **Domain**: .Tech domain support
+
+## 📁 Project Structure (Monorepo)
+
+```
+ARVS-Augmented-Recall-Vision-Systems/
+├── server/          # Backend API (Node.js + Express)
+├── web/             # Web frontend (React + Vite)
+├── mobile/          # Mobile app (Expo + React Native)
+├── shared/          # Shared TypeScript code (API client, types, utils)
+└── package.json     # Root workspace configuration
+```
+
+This is an npm workspaces monorepo, allowing shared code between web and mobile apps.
 
 ## 🚀 Quick Start
 
@@ -43,60 +57,51 @@ Never forget where you left anything. MemoryGlass is an AI-powered spatial memor
 1. **Clone the repository**
    ```bash
    git clone <your-repo-url>
-   cd chrono-weave-sol
+   cd ARVS-Augmented-Recall-Vision-Systems
    ```
 
-2. **Install frontend dependencies**
+2. **Install all dependencies** (from root - installs for all workspaces)
    ```bash
    npm install
    ```
 
-3. **Install backend dependencies**
+   This will install dependencies for:
+   - `server/` - Backend API
+   - `web/` - Web frontend
+   - `mobile/` - Mobile app
+   - `shared/` - Shared TypeScript code
+
+3. **Setup environment variables**
    ```bash
-   cd server
-   npm install
-   cd ..
+   bash create-env.sh
    ```
 
-4. **Set up environment variables**
-   
-   Create a `.env` file in the `server` directory:
-   ```env
-   # Gemini API
-   GEMINI_API_KEY=your_gemini_api_key_here
+   This creates `server/.env` with all required API keys.
 
-   # MongoDB Atlas
-   MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/memoryglass
+### Running the Application
 
-   # Solana
-   SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-   SOLANA_WALLET_SECRET=[]
-   SOLANA_TREASURY=your_treasury_wallet_address
+**Start backend server:**
+```bash
+npm run dev:server
+# or
+cd server && npm run dev
+```
 
-   # ElevenLabs
-   ELEVENLABS_API_KEY=your_elevenlabs_api_key
-   ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
+**Start web frontend:**
+```bash
+npm run dev:web
+# or
+cd web && npm run dev
+```
 
-   # Snowflake
-   SNOWFLAKE_API_URL=https://your-account.snowflakecomputing.com/api/v1/statements
-   SNOWFLAKE_API_KEY=your_snowflake_api_key
+**Start mobile app:**
+```bash
+npm run dev:mobile
+# or
+cd mobile && npm start
+```
 
-   # Server
-   PORT=3001
-   ```
-
-5. **Start the development servers**
-
-   Terminal 1 - Backend:
-   ```bash
-   cd server
-   npm run dev
-   ```
-
-   Terminal 2 - Frontend:
-   ```bash
-   npm run dev
-   ```
+See [MOBILE_SETUP.md](./MOBILE_SETUP.md) for detailed mobile app setup instructions.
 
 6. **Open your browser**
    - Frontend: http://localhost:8080

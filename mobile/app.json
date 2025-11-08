@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "MemoryGlass",
+    "slug": "memoryglass",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "scheme": "memoryglass",
+    "plugins": [
+      "expo-router"
+    ],
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.memoryglass.arvs",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Used for live AR camera streaming and AI assistance.",
+        "NSMicrophoneUsageDescription": "Used to let you ask questions with your voice.",
+        "NSSpeechRecognitionUsageDescription": "Used to transcribe your voice to text for queries."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
