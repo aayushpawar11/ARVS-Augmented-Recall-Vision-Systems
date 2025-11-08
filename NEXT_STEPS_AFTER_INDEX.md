@@ -162,3 +162,4 @@ Once the server is running and you've tested with a video upload, your vectorize
 Your system is ready! Upload a video and try a query to see the speed improvement!
 
 
+

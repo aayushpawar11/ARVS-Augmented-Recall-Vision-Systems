@@ -722,3 +722,4 @@ function needsReasoning(query) {
 This transformation will make your recall system faster, cheaper, and more scalable while maintaining the same user experience.
 
 
+

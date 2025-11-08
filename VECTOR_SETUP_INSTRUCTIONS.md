@@ -204,3 +204,4 @@ If you encounter issues:
 The system will automatically fall back to the old Gemini-based search if vector search fails, so your application will continue working even if there are issues.
 
 
+

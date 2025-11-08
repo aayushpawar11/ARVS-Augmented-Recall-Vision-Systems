@@ -358,3 +358,4 @@ Once all checkboxes are complete, your vectorized recall system is fully operati
 **Next:** Upload a video and try a query to see the speed improvement!
 
 
+

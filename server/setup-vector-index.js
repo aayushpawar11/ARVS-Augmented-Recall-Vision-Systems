@@ -39,3 +39,4 @@ console.log('\nNote: The index name must be "vector_index" for the code to work.
 console.log('='.repeat(60));
 
 
+
