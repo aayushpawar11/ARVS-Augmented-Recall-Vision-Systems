@@ -11,6 +11,14 @@ import { createAssociatedTokenAccountInstruction, getAssociatedTokenAddress, cre
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
+import { extractFrames, cleanupFrames } from './utils/frameExtractor.js';
+import { generateFrameEmbeddings, generateQueryEmbedding } from './utils/embeddings.js';
+import { storeVideoEmbeddings, searchVectors, formatTimestamp, extractObjectName } from './utils/vectorStorage.js';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegStatic from 'ffmpeg-static';
+
+// Set ffmpeg path
+ffmpeg.setFfmpegPath(ffmpegStatic);
 
 config();
 
@@ -851,26 +859,15 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     const insertResult = await db.collection('videos').insertOne(initialVideoDoc);
     const videoId = insertResult.insertedId.toString();
 
-    // Process video asynchronously and update the document
-    processVideoWithGemini(videoPath, userId)
-      .then(async (videoDoc) => {
-        // Update the video document with processed data
+    // NEW: Process video with vector embeddings (asynchronously)
+    processVideoWithVectors(videoPath, userId, videoId)
+      .then(async () => {
+        // Mark video as processed
         await db.collection('videos').updateOne(
           { _id: insertResult.insertedId },
-          {
-            $set: {
-              objects: videoDoc.objects || [],
-              activities: videoDoc.activities || [],
-              people: videoDoc.people || [],
-              scenes: videoDoc.scenes || [],
-              summary: videoDoc.summary || '',
-              questions: videoDoc.questions || [],
-              transcript: videoDoc.transcript || '',
-              processed: true
-            }
-          }
+          { $set: { processed: true } }
         );
-        console.log(`✅ Processed video: ${req.file.filename}`);
+        console.log(`✅ Processed and vectorized video: ${req.file.filename}`);
       })
       .catch(async (err) => {
         console.error('❌ Error processing video:', err);
@@ -893,6 +890,103 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
   }
 });
 
+// Process video with vector embeddings (new vectorized approach)
+async function processVideoWithVectors(videoPath, userId, videoId) {
+  try {
+    console.log(`🎬 Starting vector processing for video ${videoId}`);
+    
+    // 1. Extract frames
+    const frames = await extractFrames(videoPath, 1.0); // 1 frame per second
+    if (frames.length === 0) {
+      throw new Error('No frames extracted from video');
+    }
+    
+    // 2. Generate embeddings
+    const embeddings = await generateFrameEmbeddings(frames);
+    if (embeddings.length === 0) {
+      throw new Error('No embeddings generated');
+    }
+    
+    // 3. Store embeddings in MongoDB
+    await storeVideoEmbeddings(db, videoId, userId, embeddings, []);
+    
+    // 4. Clean up frame files
+    const framePaths = frames.map(f => f.path);
+    await cleanupFrames(framePaths);
+    
+    // 5. Optional: Still run Gemini analysis for backward compatibility
+    // This provides objects/activities/summary for the old metadata-based system
+    try {
+      const geminiData = await processVideoWithGemini(videoPath, userId);
+      await db.collection('videos').updateOne(
+        { _id: new ObjectId(videoId) },
+        {
+          $set: {
+            objects: geminiData.objects || [],
+            activities: geminiData.activities || [],
+            people: geminiData.people || [],
+            scenes: geminiData.scenes || [],
+            summary: geminiData.summary || '',
+            questions: geminiData.questions || [],
+            transcript: geminiData.transcript || ''
+          }
+        }
+      );
+    } catch (geminiError) {
+      console.warn('⚠️  Gemini analysis failed (non-critical):', geminiError.message);
+      // Continue even if Gemini fails - vector search will still work
+    }
+    
+    console.log(`✅ Vector processing complete for video ${videoId}`);
+  } catch (error) {
+    console.error('❌ Error in vector processing:', error);
+    throw error;
+  }
+}
+
+// Vector-based query processing (new approach)
+async function processVectorQuery(userId, query) {
+  try {
+    // 1. Generate query embedding
+    const queryEmbedding = await generateQueryEmbedding(query);
+    
+    // 2. Search vectors
+    const matches = await searchVectors(db, userId, queryEmbedding, 10);
+    
+    // 3. Format results (compatible with existing frontend)
+    const objectName = extractObjectName(query);
+    
+    const formattedResults = {
+      queryType: 'location',
+      object: objectName,
+      matches: matches.map(match => ({
+        videoId: match.videoId.toString(),
+        filename: match.filename,
+        timestamp: formatTimestamp(match.timestamp),
+        location: match.metadata.location || match.caption || 'Location not specified',
+        confidence: match.score || 0.5, // Vector similarity score (0-1)
+        uploadedAt: match.uploadedAt,
+        relevantInfo: match.caption || '',
+        frameNumber: match.frameNumber
+      })),
+      bestMatch: matches.length > 0 ? {
+        videoId: matches[0].videoId.toString(),
+        filename: matches[0].filename,
+        timestamp: formatTimestamp(matches[0].timestamp),
+        location: matches[0].metadata.location || matches[0].caption || 'Location not specified',
+        confidence: matches[0].score || 0.5,
+        uploadedAt: matches[0].uploadedAt,
+        frameNumber: matches[0].frameNumber
+      } : null
+    };
+    
+    return formattedResults;
+  } catch (error) {
+    console.error('Error in vector query processing:', error);
+    throw error;
+  }
+}
+
 // Query for objects or answer questions
 app.post('/api/query', async (req, res) => {
   try {
@@ -905,18 +999,31 @@ app.post('/api/query', async (req, res) => {
     const queryType = detectQueryType(query);
     let result;
 
+    // NEW: Use vector search for location queries
     if (queryType === 'location') {
-      // Object location query
-      result = await queryObjects(userId || 'anonymous', query);
-      
-      // Generate voice response for location queries
-      const responseText = result.bestMatch 
-        ? `I found your ${result.object || 'item'}. It was last seen ${result.bestMatch.location} at ${new Date(result.bestMatch.uploadedAt).toLocaleTimeString()}.`
-        : `I couldn't find ${result.object || 'that item'} in your recent memories.`;
-      
-      result.responseText = responseText;
+      try {
+        // Try vector search first (new approach)
+        result = await processVectorQuery(userId || 'anonymous', query);
+        
+        // Generate voice response for location queries
+        const responseText = result.bestMatch 
+          ? `I found your ${result.object || 'item'}. It was last seen ${result.bestMatch.location} at ${new Date(result.bestMatch.uploadedAt).toLocaleTimeString()}.`
+          : `I couldn't find ${result.object || 'that item'} in your recent memories.`;
+        
+        result.responseText = responseText;
+      } catch (vectorError) {
+        // Fallback to old Gemini-based search if vector search fails
+        console.warn('Vector search failed, falling back to Gemini:', vectorError.message);
+        result = await queryObjects(userId || 'anonymous', query);
+        
+        const responseText = result.bestMatch 
+          ? `I found your ${result.object || 'item'}. It was last seen ${result.bestMatch.location} at ${new Date(result.bestMatch.uploadedAt).toLocaleTimeString()}.`
+          : `I couldn't find ${result.object || 'that item'} in your recent memories.`;
+        
+        result.responseText = responseText;
+      }
     } else {
-      // General question about video content
+      // General question about video content (still use Gemini for now)
       result = await answerVideoQuestion(userId || 'anonymous', query, videoId);
       
       // Generate voice response for general questions
@@ -1052,6 +1159,69 @@ function getLiveStreamSession(userId) {
 // Analyze video chunk and extract objects/activities (lightweight analysis)
 // Only analyzes every Nth chunk to save API costs (configurable)
 const CHUNK_ANALYSIS_INTERVAL = 2; // Analyze every 2nd chunk (~6 seconds of video)
+
+// NEW: Generate embeddings for live stream chunks and store in vector DB
+async function vectorizeLiveChunk(videoPath, session, userId) {
+  try {
+    // Extract a single frame from the chunk (at 0.5 seconds or middle of chunk)
+    // For 3-second chunks, extract at 1.5 seconds
+    const frameDir = path.join(__dirname, 'frames');
+    await fs.mkdir(frameDir, { recursive: true });
+    
+    const chunkId = path.basename(videoPath, path.extname(videoPath));
+    const framePath = path.join(frameDir, `${chunkId}_frame.jpg`);
+    
+    // Extract frame at 1 second (middle of typical 3-second chunk)
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .seekInput(1.0) // Extract frame at 1 second
+        .frames(1)
+        .output(framePath)
+        .on('end', () => resolve())
+        .on('error', (err) => reject(err))
+        .run();
+    });
+    
+    // Generate embedding for the frame
+    const frames = [{ path: framePath, timestamp: Math.floor((Date.now() - session.startedAt) / 1000), frameNumber: session.chunks.length }];
+    const embeddings = await generateFrameEmbeddings(frames);
+    
+    if (embeddings.length > 0) {
+      // Create a temporary video ID for live sessions
+      const liveVideoId = `live_${session.userId}_${session.startedAt}`;
+      const timestamp = Math.floor((Date.now() - session.startedAt) / 1000); // Seconds since stream started
+      
+      // Store embedding with live session metadata
+      const embeddingDoc = {
+        userId,
+        videoId: liveVideoId, // Temporary ID for live sessions
+        timestamp: timestamp,
+        frameNumber: session.chunks.length,
+        caption: '', // Can be populated from Gemini analysis
+        objects: [],
+        embedding: embeddings[0].embedding,
+        metadata: {
+          scene: '',
+          activity: '',
+          location: '',
+          isLiveSession: true,
+          sessionStartedAt: session.startedAt
+        }
+      };
+      
+      // Store in MongoDB
+      await db.collection('video_embeddings').insertOne(embeddingDoc);
+      
+      // Clean up frame file
+      await cleanupFrames([framePath]);
+      
+      console.log(`🔢 Vectorized live chunk ${session.chunks.length} for session ${session.userId}`);
+    }
+  } catch (error) {
+    console.error('Error vectorizing live chunk:', error);
+    // Don't throw - continue with regular analysis
+  }
+}
 
 async function analyzeVideoChunkForMemory(videoPath, session) {
   if (!genAI) return;
@@ -1191,7 +1361,14 @@ app.post('/api/live-stream/chunk', upload.single('video'), async (req, res) => {
     const session = getLiveStreamSession(userId || 'anonymous');
     const videoPath = req.file.path;
 
-    // Analyze chunk in background (non-blocking)
+    // NEW: Vectorize chunk in background (non-blocking)
+    vectorizeLiveChunk(videoPath, session, userId || 'anonymous')
+      .catch(err => {
+        console.error('Error vectorizing live chunk:', err);
+        // Continue even if vectorization fails
+      });
+
+    // Analyze chunk in background (non-blocking) - for backward compatibility
     analyzeVideoChunkForMemory(videoPath, session)
       .then(() => {
         // Clean up file after analysis
@@ -1572,31 +1749,74 @@ Provide a clear, detailed answer based on the memory data:`;
 app.post('/api/live-stream/end', async (req, res) => {
   try {
     const { userId } = req.body;
+    const actualUserId = userId || 'anonymous';
     
-    if (liveStreamSessions.has(userId || 'anonymous')) {
-      const session = liveStreamSessions.get(userId || 'anonymous');
+    if (liveStreamSessions.has(actualUserId)) {
+      const session = liveStreamSessions.get(actualUserId);
       const duration = Math.floor((Date.now() - session.startedAt) / 1000);
+      
+      // NEW: Optionally create a permanent video record for the live session
+      // This allows the live session to be searchable like regular videos
+      const liveVideoId = `live_${actualUserId}_${session.startedAt}`;
+      
+      // Create a video document for the live session
+      try {
+        await db.collection('videos').insertOne({
+          userId: actualUserId,
+          videoPath: null, // No file path for live sessions
+          filename: `live_session_${new Date(session.startedAt).toISOString()}.webm`,
+          uploadedAt: new Date(session.startedAt),
+          processed: true,
+          isLiveSession: true,
+          duration: duration,
+          objects: session.objects.slice(-100),
+          activities: session.activities.slice(-50),
+          chunksProcessed: session.chunks.length
+        });
+        
+        // Update all embeddings from this live session to reference the new video ID
+        await db.collection('video_embeddings').updateMany(
+          { 
+            userId: actualUserId,
+            'metadata.isLiveSession': true,
+            'metadata.sessionStartedAt': session.startedAt
+          },
+          { 
+            $set: { 
+              videoId: liveVideoId,
+              'metadata.isLiveSession': false // Mark as completed
+            } 
+          }
+        );
+        
+        console.log(`✅ Live session saved as video: ${liveVideoId}`);
+      } catch (saveError) {
+        console.warn('⚠️  Could not save live session as video:', saveError.message);
+        // Continue even if save fails
+      }
       
       // Optionally save session to MongoDB for later reference
       if (session.objects.length > 0 || session.activities.length > 0) {
         await db.collection('live_sessions').insertOne({
-          userId: userId || 'anonymous',
+          userId: actualUserId,
           startedAt: new Date(session.startedAt),
           endedAt: new Date(),
           duration: duration,
           objects: session.objects.slice(-100), // Keep last 100 objects
           activities: session.activities.slice(-50), // Keep last 50 activities
-          chunksProcessed: session.chunks.length
+          chunksProcessed: session.chunks.length,
+          videoId: liveVideoId // Link to video document
         });
       }
       
-      liveStreamSessions.delete(userId || 'anonymous');
+      liveStreamSessions.delete(actualUserId);
       
       res.json({
         success: true,
         duration: duration,
         objectsDetected: session.objects.length,
-        activitiesDetected: session.activities.length
+        activitiesDetected: session.activities.length,
+        videoId: liveVideoId // Return the video ID for reference
       });
     } else {
       res.json({ success: true, message: 'No active session found' });
