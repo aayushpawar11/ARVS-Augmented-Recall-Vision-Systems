@@ -98,6 +98,139 @@ async function initServices() {
   initSolana();
 }
 
+// Helper: Extract and transcribe audio from video, detect questions
+async function extractQuestionsFromVideo(videoPath) {
+  if (!genAI) {
+    return { questions: [], transcript: '' };
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    const videoData = await fs.readFile(videoPath);
+    const base64Video = videoData.toString('base64');
+
+    // Extract audio transcript and detect questions
+    const prompt = `Analyze the audio in this video and:
+    
+    1. TRANSCRIBE: Provide a full transcript of all spoken words with timestamps
+    2. DETECT QUESTIONS: Identify any questions asked in the video. A question is any sentence that:
+       - Ends with a question mark (?)
+       - Starts with question words (what, where, when, who, why, how, did, do, does, is, are, was, were, can, could, should, would)
+       - Has an interrogative tone
+    
+    Return as JSON:
+    {
+      "transcript": "Full transcript of all spoken words",
+      "questions": [
+        {
+          "question": "What was I doing?",
+          "timestamp": "00:00:15",
+          "confidence": 0.95
+        }
+      ]
+    }`;
+
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          mimeType: 'video/mp4',
+          data: base64Video
+        }
+      }
+    ]);
+
+    const response = await result.response;
+    const text = response.text();
+    
+    // Parse JSON from response
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        questions: parsed.questions || [],
+        transcript: parsed.transcript || text
+      };
+    }
+
+    return { questions: [], transcript: text };
+  } catch (error) {
+    console.error('Error extracting questions from video:', error);
+    return { questions: [], transcript: '' };
+  }
+}
+
+// Helper: Automatically answer questions detected in video
+async function answerVideoQuestions(videoPath, questions, videoMetadata) {
+  if (!genAI || questions.length === 0) {
+    return [];
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    const videoData = await fs.readFile(videoPath);
+    const base64Video = videoData.toString('base64');
+
+    const answeredQuestions = [];
+
+    // Answer each question by analyzing the video
+    for (const question of questions) {
+      try {
+        const prompt = `The user asked this question while recording the video: "${question.question}"
+
+Analyze the video and provide a clear, detailed answer to this question. Consider:
+- What is visible in the video at the time the question was asked (timestamp: ${question.timestamp})
+- The context of what was happening
+- Any relevant objects, people, or activities shown
+
+Provide a comprehensive answer:`;
+
+        const result = await model.generateContent([
+          prompt,
+          {
+            inlineData: {
+              mimeType: 'video/mp4',
+              data: base64Video
+            }
+          }
+        ]);
+
+        const response = await result.response;
+        const answer = response.text();
+
+        answeredQuestions.push({
+          question: question.question,
+          answer: answer,
+          timestamp: question.timestamp,
+          confidence: question.confidence || 0.8,
+          answeredAt: new Date()
+        });
+      } catch (error) {
+        console.error(`Error answering question "${question.question}":`, error);
+        // Still store the question even if answer failed
+        answeredQuestions.push({
+          question: question.question,
+          answer: 'Unable to generate answer at this time.',
+          timestamp: question.timestamp,
+          confidence: question.confidence || 0.5,
+          answeredAt: new Date()
+        });
+      }
+    }
+
+    return answeredQuestions;
+  } catch (error) {
+    console.error('Error answering video questions:', error);
+    return questions.map(q => ({
+      question: q.question,
+      answer: 'Unable to generate answer.',
+      timestamp: q.timestamp,
+      confidence: q.confidence || 0.5,
+      answeredAt: new Date()
+    }));
+  }
+}
+
 // Helper: Extract frames from video and analyze with Gemini
 async function processVideoWithGemini(videoPath, userId) {
   if (!genAI) {
@@ -107,6 +240,7 @@ async function processVideoWithGemini(videoPath, userId) {
   const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
   const objects = [];
   let videoSummary = null;
+  let questionsAndAnswers = [];
   
   try {
     // Read video file
@@ -152,6 +286,20 @@ async function processVideoWithGemini(videoPath, userId) {
       videoSummary = parsed;
     }
 
+    // Extract questions from video audio
+    console.log('🎤 Extracting questions from video audio...');
+    const { questions, transcript } = await extractQuestionsFromVideo(videoPath);
+    
+    if (questions.length > 0) {
+      console.log(`❓ Found ${questions.length} question(s) in video`);
+      // Automatically answer the questions
+      questionsAndAnswers = await answerVideoQuestions(videoPath, questions, {
+        objects,
+        summary: videoSummary
+      });
+      console.log(`✅ Answered ${questionsAndAnswers.length} question(s)`);
+    }
+
     // Store in MongoDB with optimized data (limit array sizes to prevent bloat)
     const videoDoc = {
       userId,
@@ -176,10 +324,14 @@ async function processVideoWithGemini(videoPath, userId) {
       scenes: (videoSummary?.scenes || []).slice(0, 10),
       // Store summary (text only, should be small)
       summary: (videoSummary?.summary || '').substring(0, 1000), // Max 1000 chars
+      // Store questions asked in video and their answers
+      questions: questionsAndAnswers.slice(0, 10), // Limit to top 10 questions
+      transcript: transcript.substring(0, 2000), // Store transcript (max 2000 chars)
       processed: true
     };
 
-    await db.collection('videos').insertOne(videoDoc);
+    // Note: Video document is created in upload endpoint, we just return the data
+    // The upload endpoint will update it with this processed data
     
     // Create indexes to optimize queries and reduce storage overhead (ignore if already exist)
     try {
@@ -198,10 +350,20 @@ async function processVideoWithGemini(videoPath, userId) {
       userId,
       objectCount: objects.length,
       activityCount: videoSummary?.activities?.length || 0,
+      questionCount: questionsAndAnswers.length,
       timestamp: new Date()
     });
 
-    return { objects, summary: videoSummary };
+    // Return the video document data for the upload endpoint to update
+    return {
+      objects: videoDoc.objects,
+      activities: videoDoc.activities,
+      people: videoDoc.people,
+      scenes: videoDoc.scenes,
+      summary: videoDoc.summary,
+      questions: videoDoc.questions,
+      transcript: videoDoc.transcript
+    };
   } catch (error) {
     console.error('Error processing video:', error);
     throw error;
@@ -582,14 +744,59 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     const userId = req.body.userId || 'anonymous';
     const videoPath = req.file.path;
 
-    // Process video asynchronously
+    // Create initial video document to get MongoDB ID
+    const initialVideoDoc = {
+      userId,
+      videoPath,
+      filename: path.basename(videoPath),
+      uploadedAt: new Date(),
+      processed: false,
+      objects: [],
+      activities: [],
+      people: [],
+      scenes: [],
+      summary: '',
+      questions: [],
+      transcript: ''
+    };
+
+    const insertResult = await db.collection('videos').insertOne(initialVideoDoc);
+    const videoId = insertResult.insertedId.toString();
+
+    // Process video asynchronously and update the document
     processVideoWithGemini(videoPath, userId)
-      .then(() => console.log(`✅ Processed video: ${req.file.filename}`))
-      .catch(err => console.error('❌ Error processing video:', err));
+      .then(async (videoDoc) => {
+        // Update the video document with processed data
+        await db.collection('videos').updateOne(
+          { _id: insertResult.insertedId },
+          {
+            $set: {
+              objects: videoDoc.objects || [],
+              activities: videoDoc.activities || [],
+              people: videoDoc.people || [],
+              scenes: videoDoc.scenes || [],
+              summary: videoDoc.summary || '',
+              questions: videoDoc.questions || [],
+              transcript: videoDoc.transcript || '',
+              processed: true
+            }
+          }
+        );
+        console.log(`✅ Processed video: ${req.file.filename}`);
+      })
+      .catch(async (err) => {
+        console.error('❌ Error processing video:', err);
+        // Mark as failed
+        await db.collection('videos').updateOne(
+          { _id: insertResult.insertedId },
+          { $set: { processed: false, error: err.message } }
+        );
+      });
 
     res.json({
       success: true,
-      videoId: req.file.filename,
+      videoId: videoId,
+      filename: req.file.filename,
       message: 'Video uploaded and processing started'
     });
   } catch (error) {
@@ -652,7 +859,8 @@ app.get('/api/videos/:userId', async (req, res) => {
         filename: 1,
         uploadedAt: 1,
         summary: 1,
-        processed: 1
+        processed: 1,
+        questions: 1 // Include questions
       })
       .toArray();
 
@@ -660,12 +868,41 @@ app.get('/api/videos/:userId', async (req, res) => {
     const videosWithCounts = videos.map(v => ({
       ...v,
       objectCount: 0, // Will be calculated if needed
-      activityCount: 0
+      activityCount: 0,
+      questionCount: (v.questions || []).length
     }));
 
     res.json({ videos: videosWithCounts });
   } catch (error) {
     console.error('Error fetching videos:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get video details including questions and answers
+app.get('/api/video/:videoId/questions', async (req, res) => {
+  try {
+    const video = await db.collection('videos').findOne({
+      _id: ObjectId.isValid(req.params.videoId) ? new ObjectId(req.params.videoId) : req.params.videoId
+    }, {
+      projection: {
+        questions: 1,
+        transcript: 1,
+        filename: 1
+      }
+    });
+
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+
+    res.json({
+      questions: video.questions || [],
+      transcript: video.transcript || '',
+      filename: video.filename
+    });
+  } catch (error) {
+    console.error('Error fetching video questions:', error);
     res.status(500).json({ error: error.message });
   }
 });

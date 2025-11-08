@@ -2,6 +2,7 @@ import { useState } from "react";
 import { VideoUpload } from "@/components/VideoUpload";
 import { VoiceQuery } from "@/components/VoiceQuery";
 import { MemoryResults } from "@/components/MemoryResults";
+import { VideoQuestions } from "@/components/VideoQuestions";
 import { Card } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Brain, Database, Coins, BarChart3 } from "lucide-react";
@@ -30,6 +31,7 @@ interface QueryResult {
 
 const Dashboard = () => {
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
+  const [uploadedVideoId, setUploadedVideoId] = useState<string | null>(null);
   const userId = "user-1"; // In production, get from auth
 
   return (
@@ -94,7 +96,19 @@ const Dashboard = () => {
             </TabsList>
 
             <TabsContent value="upload" className="space-y-6">
-              <VideoUpload userId={userId} />
+              <VideoUpload 
+                userId={userId} 
+                onUploadComplete={(videoId) => {
+                  setUploadedVideoId(videoId);
+                  // Refresh questions after a delay to allow processing
+                  setTimeout(() => {
+                    setUploadedVideoId(videoId);
+                  }, 10000); // Check after 10 seconds
+                }}
+              />
+              {uploadedVideoId && (
+                <VideoQuestions videoId={uploadedVideoId} userId={userId} />
+              )}
             </TabsContent>
 
             <TabsContent value="search" className="space-y-6">

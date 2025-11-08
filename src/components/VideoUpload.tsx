@@ -83,6 +83,9 @@ export const VideoUpload = ({ userId = "user-1", onUploadComplete }: VideoUpload
           <div>
             <h3 className="font-semibold text-foreground">Upload Memory Footage</h3>
             <p className="text-sm text-muted-foreground">Record from your smart glasses</p>
+            <p className="text-xs text-primary/80 mt-1">
+              💡 Ask questions while recording (e.g., "What was I doing?") - they'll be answered automatically!
+            </p>
           </div>
         </div>
 
