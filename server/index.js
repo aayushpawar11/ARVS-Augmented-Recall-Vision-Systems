@@ -91,6 +91,103 @@ const INITIAL_RETRY_DELAY = 2000; // 2 seconds
 // Helper: Sleep function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Helper: Format timestamp to human-readable relative time
+function formatRelativeTime(timestamp, sessionDate = null) {
+  if (!timestamp && !sessionDate) return 'earlier';
+  
+  const date = sessionDate ? new Date(sessionDate) : new Date(timestamp);
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+  
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins} minute${diffMins !== 1 ? 's' : ''} ago`;
+  if (diffHours < 24) return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
+  if (diffDays === 1) return 'yesterday';
+  if (diffDays < 7) return `${diffDays} days ago`;
+  
+  // For older dates, use a readable format
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
+}
+
+// Helper: Format object description with context-aware details
+function formatObjectDescription(obj) {
+  const parts = [];
+  const objName = (obj.object || '').toLowerCase();
+  
+  // Start with the main object name
+  if (obj.object) parts.push(obj.object);
+  
+  // Context-aware descriptor selection based on object type
+  const details = [];
+  
+  // For drinks/beverages: prioritize flavor and brand, skip colors/accents
+  if (objName.includes('drink') || objName.includes('can') || objName.includes('bottle') || 
+      objName.includes('soda') || objName.includes('energy') || objName.includes('water') ||
+      objName.includes('juice') || objName.includes('coffee') || objName.includes('tea')) {
+    if (obj.flavor) details.push(obj.flavor);
+    if (obj.brand) details.push(obj.brand);
+    // For water bottles specifically, include color and size
+    if (objName.includes('water') && !objName.includes('energy')) {
+      if (obj.color) details.push(obj.color);
+      if (obj.size) details.push(obj.size);
+    }
+  }
+  // For containers/bottles (non-drink): prioritize color and size
+  else if (objName.includes('bottle') || objName.includes('container') || objName.includes('jar')) {
+    if (obj.color) details.push(obj.color);
+    if (obj.size) details.push(obj.size);
+    if (obj.brand) details.push(obj.brand);
+  }
+  // For food items: prioritize flavor and brand
+  else if (objName.includes('snack') || objName.includes('food') || objName.includes('package') ||
+           objName.includes('bag') || objName.includes('chips') || objName.includes('candy')) {
+    if (obj.flavor) details.push(obj.flavor);
+    if (obj.brand) details.push(obj.brand);
+    if (obj.size) details.push(obj.size);
+  }
+  // For electronics: prioritize brand and model/text
+  else if (objName.includes('phone') || objName.includes('cellphone') || objName.includes('device') ||
+           objName.includes('laptop') || objName.includes('tablet') || objName.includes('computer')) {
+    if (obj.brand) details.push(obj.brand);
+    if (obj.text) details.push(obj.text);
+    if (obj.color) details.push(obj.color);
+  }
+  // For clothing: prioritize color and size
+  else if (objName.includes('shirt') || objName.includes('pants') || objName.includes('jacket') ||
+           objName.includes('hat') || objName.includes('shoe') || objName.includes('clothing')) {
+    if (obj.color) details.push(obj.color);
+    if (obj.size) details.push(obj.size);
+    if (obj.brand) details.push(obj.brand);
+  }
+  // Default: include all relevant details
+  else {
+    if (obj.color) details.push(obj.color);
+    if (obj.brand) details.push(obj.brand);
+    if (obj.flavor) details.push(obj.flavor);
+    if (obj.size) details.push(obj.size);
+  }
+  
+  // Add details in parentheses if we have any
+  if (details.length > 0) {
+    parts.push(`(${details.join(', ')})`);
+  }
+  
+  // Add additional details if provided and not redundant
+  if (obj.details && !obj.details.toLowerCase().includes(obj.object?.toLowerCase() || '')) {
+    // Only add if it provides new information
+    const detailLower = obj.details.toLowerCase();
+    const alreadyIncluded = details.some(d => detailLower.includes(d.toLowerCase()));
+    if (!alreadyIncluded) {
+      parts.push(`- ${obj.details}`);
+    }
+  }
+  
+  return parts.join(' ');
+}
+
 // Helper: Generate content with rate limiting and retry logic
 async function generateContentWithRetry(model, prompt, options = {}) {
   const { maxRetries = MAX_RETRIES, retryDelay = INITIAL_RETRY_DELAY } = options;
@@ -1432,16 +1529,40 @@ async function analyzeVideoChunkForMemory(videoPath, session) {
     const videoData = await fs.readFile(videoPath);
     const base64Video = videoData.toString('base64');
 
-    // Lightweight analysis - just extract objects and key activities
-    const prompt = `Analyze this short video segment (3 seconds) and extract ONLY:
-    
-1. OBJECTS: List visible objects with locations (max 10 most prominent)
-2. KEY_ACTIVITY: One sentence describing what's happening
+    // Detailed analysis - extract objects with full details including colors, flavors, brands, text, and all distinguishing features
+    const prompt = `Analyze this short video segment (3 seconds) in EXTREME DETAIL and extract:
+
+1. OBJECTS: List ALL visible objects with COMPLETE DETAILS including:
+   - Full object name/description
+   - Colors (e.g., "red", "blue", "transparent")
+   - Flavors (if applicable, e.g., "cherry", "vanilla", "cola")
+   - Brand names (if visible)
+   - Text/labels visible on objects
+   - Sizes (if discernible)
+   - Any other distinguishing features (patterns, shapes, materials, etc.)
+   - Precise location description (surrounding context)
+   - Confidence score
+
+2. KEY_ACTIVITY: Detailed description of what's happening (include colors, actions, interactions)
+
+Be EXTREMELY specific and detailed. Include every visible detail like colors, flavors, text, brands, sizes, and any distinguishing characteristics.
 
 Return JSON:
 {
-  "objects": [{"object": "water bottle", "location": "on desk", "confidence": 0.9}],
-  "activity": "Person working at desk"
+  "objects": [
+    {
+      "object": "red cherry flavored Coca-Cola can",
+      "location": "on desk, center-right, next to laptop",
+      "color": "red",
+      "flavor": "cherry",
+      "brand": "Coca-Cola",
+      "text": "Coca-Cola Cherry",
+      "size": "12 oz can",
+      "confidence": 0.95,
+      "details": "Red aluminum can with white Coca-Cola logo, cherry flavor label visible"
+    }
+  ],
+  "activity": "Person working at desk with red cherry Coca-Cola can visible on the right side"
 }`;
 
     const result = await generateContentWithRetry(model, [
@@ -1463,12 +1584,18 @@ Return JSON:
       const timestamp = Date.now();
       const relativeTime = Math.floor((timestamp - session.startedAt) / 1000);
 
-      // Add to session memory
+      // Add to session memory with all detailed information
       if (parsed.objects && parsed.objects.length > 0) {
         parsed.objects.forEach(obj => {
           session.objects.push({
-            object: obj.object,
-            location: obj.location,
+            object: obj.object || obj.name || 'unknown object',
+            location: obj.location || 'unknown location',
+            color: obj.color || null,
+            flavor: obj.flavor || null,
+            brand: obj.brand || null,
+            text: obj.text || null,
+            size: obj.size || null,
+            details: obj.details || obj.description || null,
             confidence: obj.confidence || 0.7,
             timestamp,
             relativeTime: `${Math.floor(relativeTime / 60)}:${String(relativeTime % 60).padStart(2, '0')}`,
@@ -1712,23 +1839,28 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
     // For memory questions, check both current session and historical sessions
     // For present tense questions, skip memory lookup and analyze current video directly
     if (isMemoryQuestion && !isPresentTense) {
-      // Get current session objects and activities
+      // Get current session objects and activities with all detailed information, formatted for readability
+      // Always use absolute timestamp for time calculation, not relativeTime
       const currentObjects = session.objects
         .slice(-50) // Last 50 objects
-        .map(obj => ({
-          object: obj.object,
-          location: obj.location,
-          time: obj.relativeTime,
-          confidence: obj.confidence,
-          source: 'current_session'
-        }));
+        .map(obj => {
+          // Use absolute timestamp, not relativeTime (which is relative to session start)
+          const timeStr = formatRelativeTime(obj.timestamp);
+          return {
+            description: formatObjectDescription(obj),
+            location: obj.location,
+            time: timeStr,
+            confidence: obj.confidence,
+            source: 'current session'
+          };
+        });
 
       const currentActivities = session.activities
         .slice(-20) // Last 20 activities
         .map(act => ({
           activity: act.activity,
-          time: act.relativeTime,
-          source: 'current_session'
+          time: formatRelativeTime(act.timestamp), // Always use absolute timestamp
+          source: 'current session'
         }));
 
       // Get historical session memories from MongoDB (only for past-tense questions)
@@ -1739,24 +1871,28 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
         ...currentObjects,
         ...historicalMemories.objects
           .slice(-100) // Last 100 from historical sessions
-          .map(obj => ({
-            object: obj.object,
-            location: obj.location || 'unknown',
-            time: obj.relativeTime || (obj.sessionDate ? new Date(obj.sessionDate).toLocaleString() : 'previous session'),
-            confidence: obj.confidence || 0.7,
-            source: 'previous_session',
-            sessionDate: obj.sessionDate
-          }))
+          .map(obj => {
+            // Use absolute timestamp or sessionDate for accurate time calculation
+            const timeStr = formatRelativeTime(obj.timestamp || obj.sessionDate);
+            return {
+              description: formatObjectDescription(obj),
+              location: obj.location || 'unknown location',
+              time: timeStr,
+              confidence: obj.confidence || 0.7,
+              source: 'previous session',
+              sessionDate: obj.sessionDate
+            };
+          })
       ];
 
       const allActivities = [
         ...currentActivities,
-        ...historicalMemories.activities
+          ...historicalMemories.activities
           .slice(-50) // Last 50 from historical sessions
           .map(act => ({
             activity: act.activity,
-            time: act.relativeTime || (act.sessionDate ? new Date(act.sessionDate).toLocaleString() : 'previous session'),
-            source: 'previous_session',
+            time: formatRelativeTime(act.timestamp || act.sessionDate), // Always use absolute timestamp
+            source: 'previous session',
             sessionDate: act.sessionDate
           }))
       ];
@@ -1764,22 +1900,29 @@ app.post('/api/live-answer', upload.single('video'), async (req, res) => {
       // Always proceed with memory questions - even if current session is empty, check historical
       const currentSessionDuration = Math.floor((Date.now() - session.startedAt) / 60000);
       
-      memoryContext = `
-ALL SESSION MEMORIES (across all sessions):
+      // Format memory context in a human-readable way
+      const currentObjectsList = currentObjects.length > 0 
+        ? currentObjects.map(obj => `  • ${obj.description} (${obj.time}, ${obj.location})`).join('\n')
+        : '  (none yet)';
+      
+      const historicalObjectsList = allObjects.filter(obj => obj.source === 'previous session').length > 0
+        ? allObjects.filter(obj => obj.source === 'previous session')
+            .map(obj => `  • ${obj.description} (${obj.time}, ${obj.location})`)
+            .join('\n')
+        : '  (none)';
+      
+      memoryContext = `MEMORY DATA:
 
-Current Session (last ${currentSessionDuration} minutes):
-- Objects: ${currentObjects.length}
-- Activities: ${currentActivities.length}
+CURRENT SESSION (active for ${currentSessionDuration} minute${currentSessionDuration !== 1 ? 's' : ''}):
+Objects seen:
+${currentObjectsList}
 
-Historical Sessions (from ${historicalMemories.sessionCount} previous session${historicalMemories.sessionCount !== 1 ? 's' : ''}):
-- Objects: ${historicalMemories.objects.length}
-- Activities: ${historicalMemories.activities.length}
+PREVIOUS SESSIONS:
+Objects from earlier sessions:
+${historicalObjectsList}
 
-ALL OBJECTS SEEN (current + historical):
+Full detailed data:
 ${JSON.stringify(allObjects, null, 2)}
-
-ALL ACTIVITIES (current + historical):
-${JSON.stringify(allActivities, null, 2)}
 `;
 
       // For strong memory questions (past tense, "just", "was"), prioritize memory
@@ -1802,11 +1945,17 @@ ${JSON.stringify(allActivities, null, 2)}
 
 ${memoryContext}
 
-This question is asking about something from the past (current session or previous sessions). 
-Answer it based on ALL the session memories provided above - search through BOTH current session and historical sessions.
-Look for objects or activities that match what the user is asking about.
+INSTRUCTIONS FOR YOUR RESPONSE:
+- Start directly with bullet points, NO introductory sentences
+- Use simple, clear language
+- Format timestamps as relative time (e.g., "2 hours ago", "yesterday", "earlier today")
+- Each bullet point should be on its own line: "• [time] - [object description with details]"
+- Put each bullet point on a NEW LINE (one per line)
+- Be specific about object details (colors, brands, flavors) when available
+- Group by time order (most recent first)
+- Keep it concise and direct
 
-Provide a clear, detailed answer based on the memory data. If you find it in a previous session, mention that.`;
+Search through ALL the session memories provided above (both current and historical sessions) and list what was held up in bullet point format, starting with the most recent. Put each bullet point on a separate line.`;
       } else {
         // Combine memory with current video
         prompt = `Question: "${question}"
@@ -1816,14 +1965,21 @@ ${memoryContext}
 Current video context (what's visible NOW):
 [Analyze the current video segment]
 
+INSTRUCTIONS FOR YOUR RESPONSE:
+- Answer in a natural, conversational way that's easy to read and listen to
+- Use simple, clear language
+- Format timestamps as relative time (e.g., "2 hours ago", "just now")
+- Be specific about object details (colors, brands, flavors) when available
+- Make it sound natural, like you're talking to a friend
+
 Answer the question by combining:
 1. Current video context (what's visible right now)
 2. All session memories (current + historical sessions)
 
-If the question asks about something from the past, search through ALL session memories (current and historical).
+If the question asks about something from the past, search through ALL session memories.
 If asking about current state, focus on the current video.
 
-Provide a clear, concise answer (2-3 sentences):`;
+Provide a clear, natural-sounding answer:`;
       }
     } else {
       // Current context question
@@ -1832,7 +1988,13 @@ Provide a clear, concise answer (2-3 sentences):`;
 Analyze this short video segment (last few seconds) and answer the question.
 Focus on what is visible RIGHT NOW in the video.
 
-Answer (2-3 sentences, be concise):`;
+INSTRUCTIONS FOR YOUR RESPONSE:
+- Answer in a natural, conversational way that's easy to read and listen to
+- Use simple, clear language
+- Be specific about object details (colors, brands, flavors) when visible
+- Make it sound natural, like you're talking to a friend
+
+Provide a clear, natural-sounding answer:`;
     }
 
     let result;
@@ -1916,23 +2078,28 @@ Answer (2-3 sentences, be concise):`;
     if (isMemoryQuestion && (isBadRequest || !useMemoryOnly)) {
       console.log('🔄 Video processing failed for memory question, falling back to memory-only answer...');
       try {
-        // Get both current and historical memories for fallback
+        // Get both current and historical memories for fallback with all detailed information, formatted for readability
+        // Always use absolute timestamp for time calculation, not relativeTime
         const currentObjects = session.objects
           .slice(-50)
-          .map(obj => ({
-            object: obj.object,
-            location: obj.location,
-            time: obj.relativeTime,
-            confidence: obj.confidence,
-            source: 'current_session'
-          }));
+          .map(obj => {
+            // Use absolute timestamp, not relativeTime (which is relative to session start)
+            const timeStr = formatRelativeTime(obj.timestamp);
+            return {
+              description: formatObjectDescription(obj),
+              location: obj.location,
+              time: timeStr,
+              confidence: obj.confidence,
+              source: 'current session'
+            };
+          });
 
         const currentActivities = session.activities
           .slice(-20)
           .map(act => ({
             activity: act.activity,
-            time: act.relativeTime,
-            source: 'current_session'
+            time: formatRelativeTime(act.timestamp), // Always use absolute timestamp
+            source: 'current session'
           }));
 
         const historicalMemories = await getHistoricalSessionMemories(userId || 'anonymous', 10);
@@ -1941,13 +2108,17 @@ Answer (2-3 sentences, be concise):`;
           ...currentObjects,
           ...historicalMemories.objects
             .slice(-100)
-            .map(obj => ({
-              object: obj.object,
-              location: obj.location || 'unknown',
-              time: obj.relativeTime || (obj.sessionDate ? new Date(obj.sessionDate).toLocaleString() : 'previous session'),
-              confidence: obj.confidence || 0.7,
-              source: 'previous_session'
-            }))
+            .map(obj => {
+              // Use absolute timestamp or sessionDate for accurate time calculation
+              const timeStr = formatRelativeTime(obj.timestamp || obj.sessionDate);
+              return {
+                description: formatObjectDescription(obj),
+                location: obj.location || 'unknown location',
+                time: timeStr,
+                confidence: obj.confidence || 0.7,
+                source: 'previous session'
+              };
+            })
         ];
 
         const allActivities = [
@@ -1956,38 +2127,55 @@ Answer (2-3 sentences, be concise):`;
             .slice(-50)
             .map(act => ({
               activity: act.activity,
-              time: act.relativeTime || (act.sessionDate ? new Date(act.sessionDate).toLocaleString() : 'previous session'),
-              source: 'previous_session'
+              time: formatRelativeTime(act.timestamp || act.sessionDate), // Always use absolute timestamp
+              source: 'previous session'
             }))
         ];
 
         const currentSessionDuration = Math.floor((Date.now() - session.startedAt) / 60000);
-        const memoryContext = `
-ALL SESSION MEMORIES (across all sessions):
+        
+        // Format memory context in a human-readable way
+        const currentObjectsList = currentObjects.length > 0 
+          ? currentObjects.map(obj => `  • ${obj.description} (${obj.time}, ${obj.location})`).join('\n')
+          : '  (none yet)';
+        
+        const historicalObjectsList = allObjects.filter(obj => obj.source === 'previous session').length > 0
+          ? allObjects.filter(obj => obj.source === 'previous session')
+              .map(obj => `  • ${obj.description} (${obj.time}, ${obj.location})`)
+              .join('\n')
+          : '  (none)';
+        
+        const memoryContext = `MEMORY DATA:
 
-Current Session (last ${currentSessionDuration} minutes):
-- Objects: ${currentObjects.length}
-- Activities: ${currentActivities.length}
+CURRENT SESSION (active for ${currentSessionDuration} minute${currentSessionDuration !== 1 ? 's' : ''}):
+Objects seen:
+${currentObjectsList}
 
-Historical Sessions (from ${historicalMemories.sessionCount} previous session${historicalMemories.sessionCount !== 1 ? 's' : ''}):
-- Objects: ${historicalMemories.objects.length}
-- Activities: ${historicalMemories.activities.length}
+PREVIOUS SESSIONS:
+Objects from earlier sessions:
+${historicalObjectsList}
 
-ALL OBJECTS SEEN (current + historical):
+Full detailed data:
 ${JSON.stringify(allObjects, null, 2)}
-
-ALL ACTIVITIES (current + historical):
-${JSON.stringify(allActivities, null, 2)}
 `;
 
         const fallbackPrompt = `Question: "${question}"
 
 ${memoryContext}
 
+INSTRUCTIONS FOR YOUR RESPONSE:
+- Start directly with bullet points, NO introductory sentences
+- Use simple, clear language
+- Format timestamps as relative time (e.g., "2 hours ago", "yesterday", "earlier today")
+- Each bullet point should be on its own line: "• [time] - [object description with details]"
+- Put each bullet point on a NEW LINE (one per line)
+- Be specific about object details (colors, brands, flavors) when available
+- Group by time order (most recent first)
+- Keep it concise and direct
+
 The video processing failed, but answer this question based on ALL session memories provided above (current + historical sessions).
 Search through the objects and activities from ALL sessions to find what the user is asking about.
-
-Provide a clear, detailed answer based on the memory data. If found in a previous session, mention that.`;
+List the results in bullet point format, starting with the most recent. Put each bullet point on a separate line.`;
 
         if (!model) {
           model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
